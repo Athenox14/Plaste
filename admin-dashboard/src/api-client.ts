@@ -95,6 +95,7 @@ export interface TokenResp {
   is_admin: boolean
   quota_bytes: number
   used_bytes: number
+  expires_at: string | null
 }
 
 export interface AuditEntry {
@@ -109,8 +110,10 @@ export interface AuditEntry {
 
 export const api = {
   listTokens: () => request<TokenResp[]>('/admin/tokens'),
-  createToken: (body: { owner: string; is_admin: boolean; quota_bytes: number }) =>
+  createToken: (body: { owner: string; is_admin: boolean; quota_bytes: number; duration_days?: number }) =>
     requestJson<TokenResp>('/admin/tokens', 'POST', body),
   deleteToken: (id: number) => request<void>(`/admin/tokens/${id}`, { method: 'DELETE' }),
+  renewToken: (id: number, duration_days: number) =>
+    requestJson<TokenResp>(`/admin/tokens/${id}/renew`, 'PUT', { duration_days }),
   auditLog: (limit: number) => request<AuditEntry[]>(`/admin/audit-log?limit=${limit}`),
 }

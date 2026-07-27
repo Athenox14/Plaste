@@ -103,7 +103,16 @@ async fn main() {
         .merge(tus::router().layer(upload_limit))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(general_limit);
+        .layer(general_limit)
+        // ponytail: permissive CORS — this is a self-hosted server behind bearer-token auth,
+        // not cookie-based sessions, so a wide-open Access-Control-Allow-Origin carries no
+        // CSRF-style risk here; tighten to an allowlist if that assumption ever changes.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        );
 
     let port = std::env::var("PLASTE_PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("127.0.0.1:{port}");

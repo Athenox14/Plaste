@@ -379,9 +379,20 @@ async fn attach_tag(
 
 async fn list_resource_tags(
     State(state): State<AppState>,
-    _ctx: TokenCtx,
+    ctx: TokenCtx,
     Query(q): Query<ResourceTagQuery>,
 ) -> Result<Json<Vec<ResourceTagEntry>>, (StatusCode, &'static str)> {
+    // acl::check_access only recognizes singular "file"/"folder"; this endpoint's query
+    // param also accepts the plural forms used elsewhere in this file, so normalize first.
+    let acl_resource_type = match q.resource_type.as_str() {
+        "file" | "files" => "file",
+        "folder" | "folders" => "folder",
+        _ => return Err((StatusCode::NOT_FOUND, "resource not found")),
+    };
+    if !crate::acl::check_access(&state.db, &ctx, acl_resource_type, q.resource_id, crate::acl::Action::Read).await {
+        return Err((StatusCode::NOT_FOUND, "resource not found"));
+    }
+
     let rows: Vec<ResourceTagEntryRow> = state
         .db
         .query_map(

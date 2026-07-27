@@ -1107,9 +1107,17 @@ impl Query {
         resource_type: String,
         resource_id: ID,
     ) -> GqlResult<Vec<ResourceTagEntry>> {
-        let _tok = ctx_of(gctx)?;
+        let tok = ctx_of(gctx)?;
         let state = gctx.data::<AppState>()?;
         let rid = parse_id(&resource_id)?;
+        let acl_resource_type = match resource_type.as_str() {
+            "file" | "files" => "file",
+            "folder" | "folders" => "folder",
+            _ => return Err("resource not found".into()),
+        };
+        if !crate::acl::check_access(&state.db, tok, acl_resource_type, rid, crate::acl::Action::Read).await {
+            return Err("resource not found".into());
+        }
         let rows: Vec<ResourceTagEntryRow> = state
             .db
             .query_map(
@@ -1185,9 +1193,12 @@ impl Query {
 
     /// Mirrors GET /comments (comments.rs::list_comments).
     async fn comments(&self, gctx: &Context<'_>, resource_type: String, resource_id: ID) -> GqlResult<Vec<Comment>> {
-        let _tok = ctx_of(gctx)?;
+        let tok = ctx_of(gctx)?;
         let state = gctx.data::<AppState>()?;
         let rid = parse_id(&resource_id)?;
+        if !crate::acl::check_access(&state.db, tok, &resource_type, rid, crate::acl::Action::Read).await {
+            return Err("resource not found".into());
+        }
         let rows: Vec<CommentListRow> = state
             .db
             .query_map(

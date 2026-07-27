@@ -154,9 +154,13 @@ impl From<&mut hiqlite::Row<'_>> for CommentListRow {
 
 async fn list_comments(
     State(state): State<AppState>,
-    _ctx: TokenCtx,
+    ctx: TokenCtx,
     Query(q): Query<ListCommentsQuery>,
 ) -> Result<Json<Vec<CommentListItem>>, ApiErr> {
+    if !crate::acl::check_access(&state.db, &ctx, &q.resource_type, q.resource_id, crate::acl::Action::Read).await {
+        return Err((StatusCode::NOT_FOUND, "resource not found"));
+    }
+
     let rows: Vec<CommentListRow> = state
         .db
         .query_map(

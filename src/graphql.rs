@@ -796,6 +796,95 @@ async fn gql_upsert_policy(db: &hiqlite::Client, owner_token_id: Option<i64>, da
     Ok(())
 }
 
+// ---------- storage backends ----------
+
+#[derive(SimpleObject)]
+pub struct StorageBackend {
+    id: ID,
+    name: String,
+    kind: String,
+    /// JSON-encoded config, secrets redacted (mirrors REST's storage_backends.rs redaction —
+    /// s3 access_key/secret_key never come back out over the API once stored).
+    config: String,
+    is_active: bool,
+    created_at: String,
+}
+
+struct StorageBackendRow {
+    id: i64,
+    name: String,
+    kind: String,
+    config: String,
+    is_active: bool,
+    created_at: String,
+}
+impl From<&mut hiqlite::Row<'_>> for StorageBackendRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            id: row.get("id"),
+            name: row.get("name"),
+            kind: row.get("kind"),
+            config: row.get("config"),
+            is_active: row.get::<i64>("is_active") != 0,
+            created_at: row.get("created_at"),
+        }
+    }
+}
+
+/// Mirrors storage_backends.rs's `redact_config`: strips s3 access_key/secret_key before the
+/// config ever goes back out over the API.
+fn gql_redact_config(kind: &str, config: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(config).unwrap_or(serde_json::json!({}));
+    if kind == "s3" {
+        if let Some(obj) = v.as_object_mut() {
+            if obj.contains_key("access_key") {
+                obj.insert("access_key".into(), serde_json::json!("<redacted>"));
+            }
+            if obj.contains_key("secret_key") {
+                obj.insert("secret_key".into(), serde_json::json!("<redacted>"));
+            }
+        }
+    }
+    v.to_string()
+}
+
+impl From<StorageBackendRow> for StorageBackend {
+    fn from(r: StorageBackendRow) -> Self {
+        StorageBackend {
+            id: ID(r.id.to_string()),
+            name: r.name,
+            config: gql_redact_config(&r.kind, &r.config),
+            kind: r.kind,
+            is_active: r.is_active,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// Mirrors storage_backends.rs's `validate_config`.
+fn gql_validate_backend_config(kind: &str, config: &serde_json::Value) -> GqlResult<()> {
+    let has_str = |k: &str| config.get(k).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+    match kind {
+        "fs" => {
+            if has_str("path") {
+                Ok(())
+            } else {
+                Err(async_graphql::Error::new(
+                    "fs config requires non-empty 'path' (for CIFS/NFS this is the local OS mount point of the share)",
+                ))
+            }
+        }
+        "s3" => {
+            if has_str("bucket") && has_str("region") && has_str("access_key") && has_str("secret_key") {
+                Ok(())
+            } else {
+                Err(async_graphql::Error::new("s3 config requires 'bucket', 'region', 'access_key', 'secret_key' ('endpoint' optional)"))
+            }
+        }
+        _ => Err(async_graphql::Error::new("kind must be 'fs' or 's3'")),
+    }
+}
+
 pub struct Query;
 
 #[Object]
@@ -1196,6 +1285,19 @@ impl Query {
         require_admin_gql(tok)?;
         let state = gctx.data::<AppState>()?;
         Ok(RetentionPolicy { trash_retention_days: gql_global_default_days(&state.db).await })
+    }
+
+    /// Mirrors GET /admin/storage-backends (storage_backends.rs::list_backends).
+    async fn storage_backends(&self, gctx: &Context<'_>) -> GqlResult<Vec<StorageBackend>> {
+        let tok = ctx_of(gctx)?;
+        require_admin_gql(tok)?;
+        let state = gctx.data::<AppState>()?;
+        let rows: Vec<StorageBackendRow> = state
+            .db
+            .query_map("SELECT id, name, kind, config, is_active, created_at FROM storage_backends", params!())
+            .await
+            .map_err(gerr)?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 }
 
@@ -1944,6 +2046,98 @@ impl Mutation {
             created_at,
         })
     }
+
+    /// Mirrors POST /admin/storage-backends (storage_backends.rs::create_backend). `config`
+    /// is a JSON-encoded string (parsed and validated server-side against `kind`) — GraphQL
+    /// has no native free-form JSON scalar in this schema, so this follows the same
+    /// String-carrying-JSON convention already used for `mentions`/`manifest` columns.
+    async fn create_storage_backend(&self, gctx: &Context<'_>, name: String, kind: String, config: String) -> GqlResult<StorageBackend> {
+        let tok = ctx_of(gctx)?;
+        require_admin_gql(tok)?;
+        let state = gctx.data::<AppState>()?;
+        let config_val: serde_json::Value = serde_json::from_str(&config).map_err(|_| async_graphql::Error::new("config must be valid JSON"))?;
+        gql_validate_backend_config(&kind, &config_val)?;
+        let config_str = serde_json::to_string(&config_val).map_err(gerr)?;
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let id_row: IdRow = state
+            .db
+            .execute_returning_map_one(
+                "INSERT INTO storage_backends (name, kind, config, is_active, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
+                params!(&name, &kind, &config_str, &created_at),
+            )
+            .await
+            .map_err(|_| async_graphql::Error::new("backend name already exists or db error"))?;
+
+        crate::audit::log(&state.db, tok.id, "storage_backend.create", Some("storage_backend"), Some(id_row.id), None).await;
+
+        Ok(StorageBackend {
+            id: ID(id_row.id.to_string()),
+            name,
+            config: gql_redact_config(&kind, &config_str),
+            kind,
+            is_active: false,
+            created_at,
+        })
+    }
+
+    /// Mirrors DELETE /admin/storage-backends/{id} (storage_backends.rs::delete_backend):
+    /// refuses to delete the currently-active backend.
+    async fn delete_storage_backend(&self, gctx: &Context<'_>, id: ID) -> GqlResult<bool> {
+        let tok = ctx_of(gctx)?;
+        require_admin_gql(tok)?;
+        let state = gctx.data::<AppState>()?;
+        let bid = parse_id(&id)?;
+        let row: Option<StorageBackendRow> = state
+            .db
+            .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(bid))
+            .await
+            .map_err(gerr)?;
+        let row = row.ok_or(async_graphql::Error::new("backend not found"))?;
+        if row.is_active {
+            return Err(async_graphql::Error::new("cannot delete the active backend; activate another backend first"));
+        }
+        state.db.execute("DELETE FROM storage_backends WHERE id = $1", params!(bid)).await.map_err(gerr)?;
+        crate::audit::log(&state.db, tok.id, "storage_backend.delete", Some("storage_backend"), Some(bid), None).await;
+        Ok(true)
+    }
+
+    /// Mirrors POST /admin/storage-backends/{id}/activate (storage_backends.rs::activate_backend):
+    /// swaps `ChunkStore`'s live hot backend immediately (new writes only — see
+    /// `ChunkStore::activate_backend`'s doc comment for the deliberate non-migration limitation).
+    async fn activate_storage_backend(&self, gctx: &Context<'_>, id: ID) -> GqlResult<StorageBackend> {
+        let tok = ctx_of(gctx)?;
+        require_admin_gql(tok)?;
+        let state = gctx.data::<AppState>()?;
+        let bid = parse_id(&id)?;
+        let row: Option<StorageBackendRow> = state
+            .db
+            .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(bid))
+            .await
+            .map_err(gerr)?;
+        let row = row.ok_or(async_graphql::Error::new("backend not found"))?;
+
+        let config: serde_json::Value = serde_json::from_str(&row.config).map_err(gerr)?;
+        state
+            .storage
+            .activate_backend(&row.kind, &config)
+            .await
+            .map_err(|_| async_graphql::Error::new("failed to build/activate backend (bad config?)"))?;
+
+        state.db.execute("UPDATE storage_backends SET is_active = 0", params!()).await.map_err(gerr)?;
+        state.db.execute("UPDATE storage_backends SET is_active = 1 WHERE id = $1", params!(bid)).await.map_err(gerr)?;
+
+        crate::audit::log(&state.db, tok.id, "storage_backend.activate", Some("storage_backend"), Some(bid), None).await;
+
+        Ok(StorageBackend {
+            id: ID(row.id.to_string()),
+            name: row.name,
+            config: gql_redact_config(&row.kind, &row.config),
+            kind: row.kind,
+            is_active: true,
+            created_at: row.created_at,
+        })
+    }
 }
 
 pub fn build_schema(db: hiqlite::Client) -> PlasteSchema {
@@ -2002,6 +2196,7 @@ mod tests {
         crate::comments::init_schema(&db).await;
         crate::tags::init_schema(&db).await;
         crate::retention::init_schema(&db).await;
+        crate::storage_backends::init_schema(&db).await;
         let created_at = chrono::Utc::now().to_rfc3339();
         db.execute(
             "INSERT INTO tokens (token, owner, is_admin, quota_bytes, created_at) VALUES ('tok-a', 'alice', 0, 1000000, $1)",
@@ -2197,5 +2392,27 @@ mod tests {
         assert!(resp.errors.is_empty());
         let json = serde_json::to_value(&resp.data).unwrap();
         assert_eq!(json["folder"]["name"], "docs");
+    }
+
+    #[tokio::test]
+    async fn create_and_list_storage_backend_via_graphql() {
+        let state = test_state().await;
+        let admin = make_admin(&state).await;
+        let schema = Schema::build(Query, Mutation, EmptySubscription).finish();
+
+        let mutation = r#"mutation { createStorageBackend(name: "gql-fs", kind: "fs", config: "{\"path\": \"./data/gql-chunks\"}") { id name isActive } }"#;
+        let req = Request::new(mutation).data(admin.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "createStorageBackend errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        assert_eq!(json["createStorageBackend"]["name"], "gql-fs");
+        assert_eq!(json["createStorageBackend"]["isActive"], false);
+
+        let query = r#"query { storageBackends { name kind isActive } }"#;
+        let req = Request::new(query).data(admin).data(state);
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "storageBackends errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        assert_eq!(json["storageBackends"][0]["name"], "gql-fs");
     }
 }

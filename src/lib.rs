@@ -20,6 +20,7 @@ pub mod search;
 pub mod sharing;
 pub mod state;
 pub mod storage;
+pub mod storage_backends;
 pub mod tags;
 pub mod tiering;
 pub mod trash;

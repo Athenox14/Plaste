@@ -21,9 +21,13 @@ fn master_key_dir() -> PathBuf {
 }
 
 pub struct ChunkStore {
-    op: Operator,
+    /// The hot backend, behind a lock so `activate_backend` can swap it at runtime (mirrors
+    /// how `keyring` below is locked for `rotate`). `Operator` is a cheap `Arc`-like handle,
+    /// so callers lock only long enough to clone it out, never across an `.await`.
+    op: Mutex<Operator>,
     /// Local-fs root, kept for callers that still want a plain path (metadata only, not
-    /// meaningful when backed by S3).
+    /// meaningful when backed by S3, and stale after `activate_backend` swaps to a different
+    /// backend — only used by `chunk_path`, a best-effort debug helper).
     root: Option<PathBuf>,
     /// Keyring for chunk-blob encryption at rest — supports rotation (see `crypto::KeyRing`).
     /// Mutex only because `rotate` needs to mutate it; reads/writes take a brief lock.
@@ -42,7 +46,7 @@ impl ChunkStore {
         let builder = services::Fs::default().root(&root.to_string_lossy());
         let op = Operator::new(builder).expect("build fs operator").finish();
         let keyring = KeyRing::load_or_init(&master_key_dir()).expect("load keyring");
-        Self { op, root: Some(root), keyring: Mutex::new(keyring), cold: None, db: None }
+        Self { op: Mutex::new(op), root: Some(root), keyring: Mutex::new(keyring), cold: None, db: None }
     }
 
     /// Kept as an alias so existing call sites don't need to change.
@@ -68,7 +72,7 @@ impl ChunkStore {
         }
         let op = Operator::new(builder).expect("build s3 operator").finish();
         let keyring = KeyRing::load_or_init(&master_key_dir()).expect("load keyring");
-        Self { op, root: None, keyring: Mutex::new(keyring), cold: None, db: None }
+        Self { op: Mutex::new(op), root: None, keyring: Mutex::new(keyring), cold: None, db: None }
     }
 
     /// Attaches a cold-tier backend + db handle, enabling hot/cold tiering (`tiering.rs`).
@@ -92,6 +96,25 @@ impl ChunkStore {
     /// `PLASTE_S3_ACCESS_KEY`, `PLASTE_S3_SECRET_KEY`, and optional `PLASTE_S3_ENDPOINT`.
     /// fs uses `PLASTE_DATA_DIR` (default `./data`) + `/chunks`.
     pub fn from_env() -> Self {
+        let (kind, config) = Self::resolve_env_backend();
+        if kind == "s3" {
+            Self::new_s3(
+                config["bucket"].as_str().unwrap(),
+                config.get("endpoint").and_then(|v| v.as_str()),
+                config["region"].as_str().unwrap(),
+                config["access_key"].as_str().unwrap(),
+                config["secret_key"].as_str().unwrap(),
+            )
+        } else {
+            Self::new_fs(config["path"].as_str().unwrap())
+        }
+    }
+
+    /// Resolves the same env vars `from_env` does into a `(kind, config)` pair matching the
+    /// `storage_backends` table's shape. Used by `from_env` itself and by `main.rs` at
+    /// startup to persist the very first bootstrap backend as a DB row (so the DB becomes the
+    /// source of truth going forward — see storage_backends.rs).
+    pub fn resolve_env_backend() -> (String, serde_json::Value) {
         let backend = std::env::var("PLASTE_STORAGE_BACKEND").unwrap_or_else(|_| "fs".to_string());
         if backend == "s3" {
             let bucket = std::env::var("PLASTE_S3_BUCKET").expect("PLASTE_S3_BUCKET required for s3 backend");
@@ -101,16 +124,78 @@ impl ChunkStore {
             let secret_key =
                 std::env::var("PLASTE_S3_SECRET_KEY").expect("PLASTE_S3_SECRET_KEY required for s3 backend");
             let endpoint = std::env::var("PLASTE_S3_ENDPOINT").ok();
-            Self::new_s3(&bucket, endpoint.as_deref(), &region, &access_key, &secret_key)
+            (
+                "s3".to_string(),
+                serde_json::json!({
+                    "bucket": bucket, "region": region, "access_key": access_key,
+                    "secret_key": secret_key, "endpoint": endpoint,
+                }),
+            )
         } else {
             let data_dir = std::env::var("PLASTE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
             let chunks_dir = Path::new(&data_dir).join("chunks");
-            Self::new_fs(chunks_dir)
+            ("fs".to_string(), serde_json::json!({ "path": chunks_dir.to_string_lossy() }))
         }
     }
 
     fn path_for(&self, hash: &str) -> String {
         format!("{}/{hash}", &hash[0..2])
+    }
+
+    /// Clones the current hot-backend handle out from behind the lock. `Operator` is a cheap
+    /// `Arc`-like handle (see opendal docs), so this is not a meaningful clone cost, and it
+    /// lets every call site `.await` without holding the lock across an await point.
+    fn op(&self) -> Operator {
+        self.op.lock().unwrap().clone()
+    }
+
+    /// Builds an `Operator` from an admin-defined backend config (see `storage_backends.rs`).
+    /// `kind` is `"fs"` or `"s3"`; `config` is the JSON blob stored in the `storage_backends`
+    /// table (`{"path": "..."}` for fs — including CIFS/NFS, which from Plaste's perspective
+    /// is just a local path the OS has already mounted a network share onto; `{"bucket":...,
+    /// "region":..., ...}` for s3). Shared by `activate_backend` (runtime swap) and `main.rs`
+    /// (startup bootstrap-from-DB).
+    pub fn build_operator(kind: &str, config: &serde_json::Value) -> std::io::Result<Operator> {
+        match kind {
+            "fs" => {
+                let path = config
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "fs config missing 'path'"))?;
+                let builder = services::Fs::default().root(path);
+                Operator::new(builder).map(|b| b.finish()).map_err(to_io_err)
+            }
+            "s3" => {
+                let get = |k: &str| -> std::io::Result<String> {
+                    config
+                        .get(k)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("s3 config missing '{k}'")))
+                };
+                let mut builder = services::S3::default()
+                    .bucket(&get("bucket")?)
+                    .region(&get("region")?)
+                    .access_key_id(&get("access_key")?)
+                    .secret_access_key(&get("secret_key")?);
+                if let Some(endpoint) = config.get("endpoint").and_then(|v| v.as_str()) {
+                    builder = builder.endpoint(endpoint);
+                }
+                Operator::new(builder).map(|b| b.finish()).map_err(to_io_err)
+            }
+            other => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unknown backend kind {other:?}"))),
+        }
+    }
+
+    /// Swaps the live hot backend to the one described by `kind`/`config`, taking effect
+    /// immediately for all subsequent writes/reads. NOTE (deliberate MVP scope, same as
+    /// hot/cold tiering's limitation): this does NOT migrate chunks already stored under the
+    /// previously-active backend — only new writes land on the newly-activated backend. An
+    /// admin switching backends is responsible for any migration of existing data.
+    pub async fn activate_backend(&self, kind: &str, config: &serde_json::Value) -> std::io::Result<()> {
+        let new_op = Self::build_operator(kind, config)?;
+        *self.op.lock().unwrap() = new_op;
+        Ok(())
     }
 
     /// Shared per-chunk body (dedup-check, encrypt, write blob, tiering bookkeeping) used by
@@ -122,7 +207,7 @@ impl ChunkStore {
         let path = self.path_for(hash);
         // Dedup check is against the plaintext-hash key, same as before encryption was
         // added; only encrypt (with a fresh random nonce) if this content is new.
-        if !self.op.exists(&path).await.map_err(to_io_err)? {
+        if !self.op().exists(&path).await.map_err(to_io_err)? {
             let (key_id, ciphertext, nonce) = {
                 let keyring = self.keyring.lock().unwrap();
                 let (key_id, cipher) = keyring.current();
@@ -136,7 +221,7 @@ impl ChunkStore {
             stored.extend_from_slice(&pad_id(&key_id));
             stored.extend_from_slice(&nonce);
             stored.extend_from_slice(&ciphertext);
-            self.op.write(&path, stored).await.map_err(to_io_err)?;
+            self.op().write(&path, stored).await.map_err(to_io_err)?;
         }
         if let Some(db) = &self.db {
             let now = chrono::Utc::now().to_rfc3339();
@@ -200,7 +285,7 @@ impl ChunkStore {
                 let bytes = cold.read(&path).await.map_err(to_io_err)?.to_vec();
                 // Promote back to hot on read: realistic tiering behavior — data that's
                 // re-accessed after going cold is likely to be accessed again soon.
-                self.op.write(&path, bytes.clone()).await.map_err(to_io_err)?;
+                self.op().write(&path, bytes.clone()).await.map_err(to_io_err)?;
                 let _ = cold.delete(&path).await;
                 if let Some(db) = &self.db {
                     let now = chrono::Utc::now().to_rfc3339();
@@ -213,7 +298,7 @@ impl ChunkStore {
                 }
                 bytes
             } else {
-                let bytes = self.op.read(&path).await.map_err(to_io_err)?.to_vec();
+                let bytes = self.op().read(&path).await.map_err(to_io_err)?.to_vec();
                 if let Some(db) = &self.db {
                     let now = chrono::Utc::now().to_rfc3339();
                     let _ = db
@@ -280,12 +365,12 @@ impl ChunkStore {
         let mut migrated = 0u64;
         for row in rows {
             let path = self.path_for(&row.hash);
-            let bytes = match self.op.read(&path).await {
+            let bytes = match self.op().read(&path).await {
                 Ok(b) => b.to_vec(),
                 Err(_) => continue, // blob already gone (e.g. gc'd); skip
             };
             cold.write(&path, bytes).await.map_err(to_io_err)?;
-            self.op.delete(&path).await.map_err(to_io_err)?;
+            self.op().delete(&path).await.map_err(to_io_err)?;
             db.execute(
                 "UPDATE chunk_access SET tier = 'cold' WHERE hash = $1",
                 hiqlite::params!(row.hash),
@@ -304,12 +389,12 @@ impl ChunkStore {
     }
 
     pub async fn chunk_exists(&self, hash: &str) -> std::io::Result<bool> {
-        self.op.exists(&self.path_for(hash)).await.map_err(to_io_err)
+        self.op().exists(&self.path_for(hash)).await.map_err(to_io_err)
     }
 
     /// Removes a chunk blob from storage. Missing blob is not an error (already gone).
     pub async fn delete_chunk(&self, hash: &str) -> std::io::Result<()> {
-        self.op.delete(&self.path_for(hash)).await.map_err(to_io_err)
+        self.op().delete(&self.path_for(hash)).await.map_err(to_io_err)
     }
 
     /// Rotates the master keyring: generates a new key, makes it current for all future
@@ -443,5 +528,24 @@ mod tests {
             "fake-access-key",
             "fake-secret-key",
         );
+    }
+
+    #[tokio::test]
+    async fn activate_backend_swaps_hot_operator_for_new_writes() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new_fs(dir_a.path());
+
+        let (manifest_a, _) = store.write(b"data written before activation").await.unwrap();
+        let hash_a = manifest_a[0].clone();
+        assert!(dir_a.path().join(&hash_a[0..2]).join(&hash_a).exists());
+
+        let config = serde_json::json!({ "path": dir_b.path().to_string_lossy() });
+        store.activate_backend("fs", &config).await.unwrap();
+
+        let (manifest_b, _) = store.write(b"data written after activation, different bytes").await.unwrap();
+        let hash_b = manifest_b[0].clone();
+        assert!(dir_b.path().join(&hash_b[0..2]).join(&hash_b).exists(), "post-activation write should land in new backend");
+        assert!(!dir_a.path().join(&hash_b[0..2]).join(&hash_b).exists(), "post-activation write should NOT land in old backend");
     }
 }

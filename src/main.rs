@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, groups, keymgmt, mcp,
-    ratelimit, retention, search, sharing, state::AppState, storage, tags, tiering, trash, tus};
+    ratelimit, retention, search, sharing, state::AppState, storage, storage_backends, tags, tiering, trash, tus};
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +20,7 @@ async fn main() {
     files::init_schema(&db).await;
     tiering::init_schema(&db).await;
     tus::init_schema(&db).await;
+    storage_backends::init_schema(&db).await;
 
     let fts_dir = std::path::Path::new(&data_dir).join("fts_index");
     let fts = plaste::fulltext::FullTextIndex::open_or_create(&fts_dir).expect("open fts index");
@@ -28,6 +29,44 @@ async fn main() {
     storage::ensure_dir(&cold_root).await;
     let cold_op = storage::ChunkStore::new_fs_cold(&cold_root);
     let chunk_store = storage::ChunkStore::from_env().with_tiering(cold_op, db.clone());
+
+    // Admin-configurable storage backends (storage_backends.rs): if the DB already has an
+    // active backend row, that's the source of truth — swap the just-built (from_env) hot
+    // backend to point at it. Otherwise this is the very first run: persist whatever
+    // from_env() resolved to as the first row (marked active), so the DB becomes the source
+    // of truth from here on and admins can list/switch via the API.
+    struct ActiveBackendRow {
+        kind: String,
+        config: String,
+    }
+    impl From<&mut hiqlite::Row<'_>> for ActiveBackendRow {
+        fn from(row: &mut hiqlite::Row<'_>) -> Self {
+            Self { kind: row.get("kind"), config: row.get("config") }
+        }
+    }
+    let active: Option<ActiveBackendRow> = db
+        .query_map_optional("SELECT kind, config FROM storage_backends WHERE is_active = 1", hiqlite::params!())
+        .await
+        .unwrap_or(None);
+    match active {
+        Some(row) => {
+            let config: serde_json::Value = serde_json::from_str(&row.config).expect("stored storage_backends config is valid JSON");
+            chunk_store
+                .activate_backend(&row.kind, &config)
+                .await
+                .expect("activate DB-configured storage backend at startup");
+        }
+        None => {
+            let (kind, config) = storage::ChunkStore::resolve_env_backend();
+            let config_str = serde_json::to_string(&config).expect("serialize bootstrap backend config");
+            db.execute(
+                "INSERT INTO storage_backends (name, kind, config, is_active, created_at) VALUES ('bootstrap', $1, $2, 1, $3)",
+                hiqlite::params!(&kind, &config_str, chrono::Utc::now().to_rfc3339()),
+            )
+            .await
+            .expect("persist bootstrap storage backend row");
+        }
+    }
 
     let state = AppState {
         db,
@@ -99,6 +138,7 @@ async fn main() {
         .merge(retention::router())
         .merge(search::router())
         .merge(sharing::router())
+        .merge(storage_backends::router())
         .merge(tags::router())
         .merge(trash::router())
         .merge(tus::router().layer(upload_limit))

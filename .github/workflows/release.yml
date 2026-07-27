@@ -39,6 +39,8 @@ jobs:
 
   desktop:
     needs: create-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +85,8 @@ jobs:
 
   backend-binary:
     needs: create-release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:

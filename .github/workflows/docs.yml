@@ -1,0 +1,30 @@
+name: Docs
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "DOC.md"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate DOC.md
+        run: bash scripts/generate_docs.sh
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add DOC.md
+          git diff --staged --quiet || git commit -m "docs: update DOC.md [skip ci]"
+          git push

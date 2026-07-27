@@ -1,0 +1,35 @@
+[package]
+name = "plaste"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.11.0"
+async-graphql = "7.2.1"
+async-graphql-axum = "7.2.1"
+axum = { version = "0.8.9", features = ["multipart"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+base64 = "0.23.0"
+blake3 = "1.8.5"
+chrono = { version = "0.4.45", features = ["serde"] }
+fast_rsync = "0.2.0"
+fastcdc = "4.0.1"
+futures-util = "0.3.33"
+governor = "0.10.4"
+hiqlite = { version = "0.14.0", default-features = false, features = ["sqlite", "macros"] }
+mime_guess = "2.0.5"
+opendal = { version = "0.57.0", features = ["services-fs", "services-s3"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tantivy = "0.26.1"
+tokio = { version = "1.53.1", features = ["full"] }
+tower-http = { version = "0.7.0", features = ["trace"] }
+tower_governor = "0.8.0"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.24.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }

@@ -1,0 +1,16 @@
+/target
+
+# runtime data (chunks, hiqlite db, master keys, fts index) — never commit
+/data/
+*_smoketest_data/
+
+# frontends / tauri
+node_modules/
+dist/
+client/src-tauri/target/
+client/src-tauri/gen/
+
+# misc
+*.log
+.env
+nul

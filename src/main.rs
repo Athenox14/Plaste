@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use plaste::{admin, audit, auth, comments, db, files, folders, gc, graphql, groups, keymgmt, mcp, ratelimit,
-    retention, search, sharing, state::AppState, storage, tags, tiering, trash, tus};
+use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, groups, keymgmt, mcp,
+    ratelimit, retention, search, sharing, state::AppState, storage, tags, tiering, trash, tus};
 
 #[tokio::main]
 async fn main() {
@@ -88,6 +88,7 @@ async fn main() {
     let app = axum::Router::new()
         .merge(admin::router())
         .merge(audit::router())
+        .merge(chunk_upload::router().layer(upload_limit.clone()))
         .merge(comments::router())
         .merge(files::router().layer(upload_limit.clone()))
         .merge(folders::router())

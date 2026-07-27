@@ -159,6 +159,96 @@ impl PlasteClient {
         .map(|b| b.to_vec())
     }
 
+    /// Asks the server which of `hashes` (BLAKE3 hex) it doesn't already have chunk blobs
+    /// for. Returns the missing subset — only those need to be uploaded via `upload_chunk`.
+    pub async fn check_missing_chunks(&self, hashes: &[String]) -> Result<Vec<String>, String> {
+        let url = format!("{}/chunks/check", self.base_url);
+        #[derive(Serialize)]
+        struct Req<'a> {
+            hashes: &'a [String],
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            missing: Vec<String>,
+        }
+        (|| async {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(&Req { hashes })
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Resp>()
+                .await
+        })
+        .retry(retry_policy())
+        .await
+        .map_err(|e| e.to_string())
+        .map(|r: Resp| r.missing)
+    }
+
+    /// Uploads one chunk's raw plaintext bytes; the server verifies `hash` against the
+    /// actual content before storing it.
+    pub async fn upload_chunk(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let url = format!("{}/chunks/upload/{hash}", self.base_url);
+        (|| async {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .body(bytes.clone())
+                .send()
+                .await?
+                .error_for_status()
+        })
+        .retry(retry_policy())
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Assembles a manifest whose chunks are all already uploaded (via `upload_chunk`) into
+    /// a new file version. No file bytes travel in this call — just the chunk hash list.
+    pub async fn finalize_file(
+        &self,
+        folder_id: Option<i64>,
+        name: &str,
+        manifest: Vec<String>,
+        size: i64,
+        expected_base_version: Option<i64>,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{}/files/finalize", self.base_url);
+        #[derive(Serialize)]
+        struct Req {
+            folder_id: Option<i64>,
+            name: String,
+            manifest: Vec<String>,
+            size: i64,
+            expected_base_version: Option<i64>,
+        }
+        let req = Req {
+            folder_id,
+            name: name.to_string(),
+            manifest,
+            size,
+            expected_base_version,
+        };
+        (|| async {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(&req)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<serde_json::Value>()
+                .await
+        })
+        .retry(retry_policy())
+        .await
+        .map_err(|e| e.to_string())
+    }
+
     /// Uploads a `fast_rsync` delta computed against `base_version`; the server
     /// reconstructs the full new version from it. Only the delta bytes travel over the
     /// network, not the whole file.

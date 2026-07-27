@@ -2,6 +2,7 @@ pub mod acl;
 pub mod admin;
 pub mod audit;
 pub mod auth;
+pub mod chunk_upload;
 pub mod comments;
 pub mod crypto;
 pub mod db;

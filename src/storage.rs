@@ -113,6 +113,44 @@ impl ChunkStore {
         format!("{}/{hash}", &hash[0..2])
     }
 
+    /// Shared per-chunk body (dedup-check, encrypt, write blob, tiering bookkeeping) used by
+    /// both `write` (CDC-splits a whole buffer) and `write_single_chunk` (already-hashed
+    /// chunk from the client dedup-aware upload path, see chunk_upload.rs). Caller is
+    /// responsible for `hash` actually matching `bytes` (verified at the HTTP boundary for
+    /// the single-chunk path; always true for `write` since it computes the hash itself).
+    async fn write_chunk_bytes(&self, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let path = self.path_for(hash);
+        // Dedup check is against the plaintext-hash key, same as before encryption was
+        // added; only encrypt (with a fresh random nonce) if this content is new.
+        if !self.op.exists(&path).await.map_err(to_io_err)? {
+            let (key_id, ciphertext, nonce) = {
+                let keyring = self.keyring.lock().unwrap();
+                let (key_id, cipher) = keyring.current();
+                let nonce = Nonce::generate();
+                let ciphertext = cipher
+                    .encrypt(&nonce, bytes)
+                    .map_err(|e| std::io::Error::other(format!("chunk encryption failed: {e}")))?;
+                (key_id.to_string(), ciphertext, nonce)
+            };
+            let mut stored = Vec::with_capacity(KEY_ID_LEN + NONCE_LEN + ciphertext.len());
+            stored.extend_from_slice(&pad_id(&key_id));
+            stored.extend_from_slice(&nonce);
+            stored.extend_from_slice(&ciphertext);
+            self.op.write(&path, stored).await.map_err(to_io_err)?;
+        }
+        if let Some(db) = &self.db {
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = db
+                .execute(
+                    "INSERT INTO chunk_access (hash, tier, last_accessed) VALUES ($1, 'hot', $2) \
+                     ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2",
+                    hiqlite::params!(hash.to_string(), now),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
     /// Splits data into content-defined chunks, writes new ones (dedup via BLAKE3 CAS),
     /// returns manifest (ordered list of chunk hashes) and total size.
     pub async fn write(&self, data: &[u8]) -> std::io::Result<(Vec<String>, i64)> {
@@ -120,38 +158,17 @@ impl ChunkStore {
         for chunk in FastCDC::new(data, MIN, AVG, MAX) {
             let bytes = &data[chunk.offset..chunk.offset + chunk.length];
             let hash = blake3::hash(bytes).to_hex().to_string();
-            let path = self.path_for(&hash);
-            // Dedup check is against the plaintext-hash key, same as before encryption was
-            // added; only encrypt (with a fresh random nonce) if this content is new.
-            if !self.op.exists(&path).await.map_err(to_io_err)? {
-                let (key_id, ciphertext, nonce) = {
-                    let keyring = self.keyring.lock().unwrap();
-                    let (key_id, cipher) = keyring.current();
-                    let nonce = Nonce::generate();
-                    let ciphertext = cipher
-                        .encrypt(&nonce, bytes)
-                        .map_err(|e| std::io::Error::other(format!("chunk encryption failed: {e}")))?;
-                    (key_id.to_string(), ciphertext, nonce)
-                };
-                let mut stored = Vec::with_capacity(KEY_ID_LEN + NONCE_LEN + ciphertext.len());
-                stored.extend_from_slice(&pad_id(&key_id));
-                stored.extend_from_slice(&nonce);
-                stored.extend_from_slice(&ciphertext);
-                self.op.write(&path, stored).await.map_err(to_io_err)?;
-            }
-            if let Some(db) = &self.db {
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = db
-                    .execute(
-                        "INSERT INTO chunk_access (hash, tier, last_accessed) VALUES ($1, 'hot', $2) \
-                         ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2",
-                        hiqlite::params!(hash.clone(), now),
-                    )
-                    .await;
-            }
+            self.write_chunk_bytes(&hash, bytes).await?;
             manifest.push(hash);
         }
         Ok((manifest, data.len() as i64))
+    }
+
+    /// Writes one already-hashed chunk (the chunk-aware upload path's `POST
+    /// /chunks/upload/{hash}` — see chunk_upload.rs). Caller must have already verified
+    /// `hash == blake3(bytes)` before calling this (this method trusts `hash` as given).
+    pub async fn write_single_chunk(&self, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_chunk_bytes(hash, bytes).await
     }
 
     /// Reads the tier a chunk is currently stored in ('hot' if there's no tiering db attached

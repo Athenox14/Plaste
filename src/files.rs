@@ -31,7 +31,7 @@ pub fn router() -> Router<AppState> {
 /// this module needs its own schema again.
 pub async fn init_schema(_db: &hiqlite::Client) {}
 
-type ApiErr = (StatusCode, &'static str);
+pub(crate) type ApiErr = (StatusCode, &'static str);
 
 /// Row for `files` lookups.
 struct FileRow {
@@ -131,6 +131,45 @@ fn split_name(name: &str) -> (&str, &str) {
     }
 }
 
+/// Source of a new version's content: either raw bytes to be CDC-chunked and written fresh
+/// (existing `upload`/`upload_delta`/tus callers), or an already-fully-uploaded manifest to
+/// assemble directly with no chunking/writing step (chunk_upload.rs's finalize — chunks were
+/// already transmitted individually via `POST /chunks/upload/{hash}`).
+pub(crate) enum ContentSource<'a> {
+    Raw(&'a [u8]),
+    Manifest(Vec<String>, i64),
+}
+
+/// Upserts one manifest-reference's worth of refcount for `hash`: increments if the `chunks`
+/// row already exists, inserts a fresh row (refcount 1) otherwise. Shared by
+/// `write_version_row_from_source` and chunk_upload.rs's finalize handler, so every path that
+/// creates a new file_versions row reusing this hash bumps refcount exactly the same way.
+pub(crate) async fn bump_or_insert_chunk_refcount(state: &AppState, hash: &str, size: i64) -> Result<(), ApiErr> {
+    let existing = state
+        .db
+        .query_map_optional::<HashRow, _>("SELECT hash FROM chunks WHERE hash = $1", params!(hash))
+        .await
+        .ok()
+        .flatten();
+    if existing.is_some() {
+        state
+            .db
+            .execute("UPDATE chunks SET refcount = refcount + 1 WHERE hash = $1", params!(hash))
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    } else {
+        state
+            .db
+            .execute(
+                "INSERT INTO chunks (hash, size, refcount) VALUES ($1, $2, 1)",
+                params!(hash, size),
+            )
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    }
+    Ok(())
+}
+
 /// Entry point shared by `upload`, `upload_delta`, and tus's `finish_upload`. If
 /// `expected_base_version` is `Some` and doesn't match the file's current version_no,
 /// this is a conflict: the new content is stored as version 1 of a brand-new
@@ -140,6 +179,37 @@ pub(crate) async fn store_new_version(
     state: &AppState,
     file_id: i64,
     data: &[u8],
+    expected_base_version: Option<i64>,
+    uploader_token_id: i64,
+) -> Result<StoreOutcome, ApiErr> {
+    store_new_version_impl(state, file_id, ContentSource::Raw(data), expected_base_version, uploader_token_id).await
+}
+
+/// Same as `store_new_version` but for chunk_upload.rs's finalize: `manifest`'s chunks are
+/// already fully present in the `chunks` table (verified by the caller), so this skips
+/// chunking/writing and goes straight to the version-row/refcount/conflict-check tail.
+pub(crate) async fn store_new_version_from_manifest(
+    state: &AppState,
+    file_id: i64,
+    manifest: Vec<String>,
+    size: i64,
+    expected_base_version: Option<i64>,
+    uploader_token_id: i64,
+) -> Result<StoreOutcome, ApiErr> {
+    store_new_version_impl(
+        state,
+        file_id,
+        ContentSource::Manifest(manifest, size),
+        expected_base_version,
+        uploader_token_id,
+    )
+    .await
+}
+
+async fn store_new_version_impl(
+    state: &AppState,
+    file_id: i64,
+    source: ContentSource<'_>,
     expected_base_version: Option<i64>,
     uploader_token_id: i64,
 ) -> Result<StoreOutcome, ApiErr> {
@@ -176,7 +246,7 @@ pub(crate) async fn store_new_version(
                 .await
                 .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
 
-            let (_version_id, _version_no, size) = write_version_row(state, new_file.id, data).await?;
+            let (_version_id, _version_no, size) = write_version_row_from_source(state, new_file.id, source).await?;
 
             crate::audit::log(
                 &state.db,
@@ -197,51 +267,32 @@ pub(crate) async fn store_new_version(
         }
     }
 
-    let (version_id, version_no, size) = write_version_row(state, file_id, data).await?;
+    let (version_id, version_no, size) = write_version_row_from_source(state, file_id, source).await?;
     Ok(StoreOutcome::Normal { version_id, version_no, size })
 }
 
-/// Chunk-writes `data`, upserts chunk refcounts, inserts a new `file_versions` row for
-/// `file_id`, and points `files.current_version_id` at it. Returns (version_id, version_no, size).
-async fn write_version_row(state: &AppState, file_id: i64, data: &[u8]) -> Result<(i64, i64, i64), ApiErr> {
-    let (manifest, size) = state
-        .storage
-        .write(data)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage write failed"))?;
+/// Chunk-writes `data` (or reuses an already-uploaded manifest), upserts chunk refcounts,
+/// inserts a new `file_versions` row for `file_id`, and points `files.current_version_id` at
+/// it. Returns (version_id, version_no, size).
+async fn write_version_row_from_source(
+    state: &AppState,
+    file_id: i64,
+    source: ContentSource<'_>,
+) -> Result<(i64, i64, i64), ApiErr> {
+    let (manifest, size) = match source {
+        ContentSource::Raw(data) => state
+            .storage
+            .write(data)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage write failed"))?,
+        ContentSource::Manifest(manifest, size) => (manifest, size),
+    };
 
     for hash in &manifest {
         // `hash` is TEXT, not an i64 id — must not be mapped through `IdRow` (that panics
         // on the type mismatch inside hiqlite's row conversion whenever a matching chunk
         // is actually found, i.e. whenever dedup does its job).
-        let existing = state
-            .db
-            .query_map_optional::<HashRow, _>(
-                "SELECT hash FROM chunks WHERE hash = $1",
-                params!(hash),
-            )
-            .await
-            .ok()
-            .flatten();
-        if existing.is_some() {
-            state
-                .db
-                .execute(
-                    "UPDATE chunks SET refcount = refcount + 1 WHERE hash = $1",
-                    params!(hash),
-                )
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
-        } else {
-            state
-                .db
-                .execute(
-                    "INSERT INTO chunks (hash, size, refcount) VALUES ($1, $2, 1)",
-                    params!(hash, size),
-                )
-                .await
-                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
-        }
+        bump_or_insert_chunk_refcount(state, hash, size).await?;
     }
 
     let version_no = next_version_no(state, file_id).await?;
@@ -395,7 +446,7 @@ struct UploadFields {
 /// callers can branch on one field; the normal-path fields are populated when
 /// `conflict == false`, the conflict-path fields when `conflict == true`.
 #[derive(Serialize)]
-struct UploadResp {
+pub(crate) struct UploadResp {
     conflict: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_id: Option<i64>,
@@ -413,7 +464,7 @@ struct UploadResp {
 }
 
 impl UploadResp {
-    fn from_outcome(file_id: i64, outcome: StoreOutcome) -> Self {
+    pub(crate) fn from_outcome(file_id: i64, outcome: StoreOutcome) -> Self {
         match outcome {
             StoreOutcome::Normal { version_id, version_no, size } => UploadResp {
                 conflict: false,

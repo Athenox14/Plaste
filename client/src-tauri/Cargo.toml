@@ -36,6 +36,10 @@ mimalloc = "0.1.52"
 starship-battery = "0.11.1"
 tokio = { version = "1.53.1", features = ["full"] }
 fast_rsync = "0.2.0"
+dirs = "6.0.0"
+windows = { version = "0.62.2", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Com"] }
+fastcdc = "4.0.1"
+blake3 = "1.8.5"
 
 [target."cfg(windows)".dependencies]
 cloud-filter = "0.0.6"

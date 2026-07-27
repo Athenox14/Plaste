@@ -1,7 +1,9 @@
 mod api_client;
+mod known_folders;
 mod power;
 mod sync_config;
 mod sync_engine;
+mod user_folders;
 mod virtualfs;
 mod watcher;
 
@@ -98,6 +100,11 @@ pub fn run() {
             power::get_power_status,
             sync_engine::test_connection,
             sync_engine::sync_file_delta_cmd,
+            sync_engine::upload_file_dedup_aware_cmd,
+            user_folders::ensure_plaste_folders_cmd,
+            known_folders::list_known_folders,
+            known_folders::redirect_folder_cmd,
+            known_folders::revert_folder_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

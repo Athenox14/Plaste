@@ -26,9 +26,9 @@ out=DOC.md
     echo "- \`$path\`"
   done
   echo
-  echo "## Frontends"
+  echo "## Desktop client"
   echo
-  for d in client admin-dashboard file-explorer; do
+  for d in client; do
     [ -d "$d" ] || continue
     echo "- **$d/** — $( [ -f "$d/package.json" ] && grep -m1 '"name"' "$d/package.json" | sed -E 's/.*"name":\s*"([^"]+)".*/\1/' || echo "$d" )"
   done

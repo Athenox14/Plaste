@@ -2,14 +2,14 @@
 
 Self-hosted drive/sync server, written in Rust — chunked upload/download, cross-file dedup, encryption at rest, versioning, search, sharing, and a desktop sync client. Nextcloud/Dropbox-style, no third-party cloud dependency.
 
+API-only management: there is no web admin UI or file-browser web app. Everything (users/tokens, folders/files, sharing, tags, comments, groups, storage backends...) is managed via REST or GraphQL. The only GUI is the desktop sync client.
+
 ## What's here
 
 | Path | What it is |
 |---|---|
 | `src/` | Backend server (axum + hiqlite). REST, GraphQL, and an MCP server, all on one binary. |
-| `client/` | Desktop sync client (Tauri, Windows/macOS/Linux). |
-| `admin-dashboard/` | Web app for token/quota/user management and the audit log. |
-| `file-explorer/` | Web app — the actual end-user file browser (upload, preview, search, sharing). |
+| `client/` | Desktop sync client "Plaste Sync" (Tauri, Windows/macOS/Linux). |
 | `.github/workflows/` | CI: Docker image build, multi-platform release build, auto-generated `DOC.md`. |
 | `DOC.md` | Auto-generated module/endpoint map, regenerated on every push to `main`. |
 
@@ -34,15 +34,13 @@ First run prints a bootstrap admin token — that's your only way in, there's no
 
 Key env vars: `PLASTE_DATA_DIR` (default `./data`), `PLASTE_PORT` (default `8080`), `PLASTE_TLS_CERT`/`PLASTE_TLS_KEY` (enables HTTPS if both set), `PLASTE_STORAGE_BACKEND` (`fs` or `s3`, + `PLASTE_S3_*` vars), `PLASTE_MASTER_KEY` (base64 32-byte encryption key; auto-generated if unset).
 
-## Running the frontends
+## Running the desktop client
 
 ```sh
-cd admin-dashboard && npm install && npm run dev   # token/quota/audit management
-cd file-explorer  && npm install && npm run dev    # the actual file browser
-cd client/src-tauri && cargo tauri dev              # desktop sync client
+cd client/src-tauri && cargo tauri dev
 ```
 
-Each is a plain Vite app pointed at `http://127.0.0.1:8080` by default — paste an admin token issued from the backend on first load.
+Everything else — creating users/tokens, browsing/uploading files, sharing, tags, comments, groups, storage backends — goes through the API directly (`curl`, GraphQL client, or the MCP server) rather than a web UI.
 
 ## Releases
 

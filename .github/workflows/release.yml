@@ -23,20 +23,19 @@ jobs:
     outputs:
       release_id: ${{ steps.create.outputs.releaseId }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
       - name: Create draft release
         id: create
-        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.event.inputs.version || github.ref_name }}
-          releaseName: "Plaste ${{ github.event.inputs.version || github.ref_name }}"
-          releaseDraft: true
-          prerelease: false
-          projectPath: client/src-tauri
-          includeUpdaterJson: false
+        run: |
+          tag="${{ github.event.inputs.version || github.ref_name }}"
+          release_id=$(gh api "repos/${{ github.repository }}/releases" \
+            -f tag_name="$tag" \
+            -f name="Plaste $tag" \
+            -F draft=true \
+            -F prerelease=false \
+            --jq .id)
+          echo "releaseId=$release_id" >> "$GITHUB_OUTPUT"
 
   desktop:
     needs: create-release

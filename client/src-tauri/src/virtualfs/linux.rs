@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyEntry, Request};
+use fuser::{
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
+    ReplyAttr, ReplyData, ReplyEntry, Request,
+};
 
 use super::{Result, VirtualFilesystem};
 
@@ -85,7 +88,7 @@ impl PlasteFuseFs {
     fn attr_for(ino: u64, size: u64, kind: FileType) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size,
             blocks: (size + 511) / 512,
             atime: now,
@@ -109,45 +112,49 @@ impl PlasteFuseFs {
 }
 
 impl Filesystem for PlasteFuseFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if parent != ROOT_INO {
-            reply.error(libc_enoent());
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if parent.0 != ROOT_INO {
+            reply.error(Errno::ENOENT);
             return;
         }
         let Some(name) = name.to_str() else {
-            reply.error(libc_enoent());
+            reply.error(Errno::ENOENT);
             return;
         };
         match self.table.0.lock().unwrap().get(name) {
-            Some(meta) => reply.entry(&TTL, &Self::attr_for(meta.ino, meta.size, FileType::RegularFile), 0),
-            None => reply.error(libc_enoent()),
+            Some(meta) => reply.entry(
+                &TTL,
+                &Self::attr_for(meta.ino, meta.size, FileType::RegularFile),
+                Generation(0),
+            ),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino == ROOT_INO {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if ino.0 == ROOT_INO {
             reply.attr(&TTL, &Self::attr_for(ROOT_INO, 0, FileType::Directory));
             return;
         }
-        match self.table.get_by_ino(ino) {
-            Some((_, meta)) => reply.attr(&TTL, &Self::attr_for(ino, meta.size, FileType::RegularFile)),
-            None => reply.error(libc_enoent()),
+        match self.table.get_by_ino(ino.0) {
+            Some((_, meta)) => reply.attr(&TTL, &Self::attr_for(ino.0, meta.size, FileType::RegularFile)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock: Option<u64>,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some((name, meta)) = self.table.get_by_ino(ino) else {
-            reply.error(libc_enoent());
+        let Some((name, meta)) = self.table.get_by_ino(ino.0) else {
+            reply.error(Errno::ENOENT);
             return;
         };
 
@@ -170,11 +177,6 @@ impl Filesystem for PlasteFuseFs {
         let end = (start + size as usize).min(data.len());
         reply.data(data.get(start..end).unwrap_or(&[]));
     }
-}
-
-fn libc_enoent() -> i32 {
-    // ponytail: hand-rolled instead of pulling `libc` just for one errno constant.
-    2
 }
 
 pub struct LinuxVfs {

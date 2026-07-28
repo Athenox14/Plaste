@@ -1,18 +1,36 @@
+use std::io::Write;
 use std::sync::Arc;
 
 use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, groups, keymgmt, mcp,
     ratelimit, retention, search, sharing, state::AppState, storage, storage_backends, tags, tiering, trash, tus};
 
+// TEMPORARY: startup breadcrumbs for diagnosing a silent-exit-0 bug that only reproduces
+// inside the container. Bypasses the tracing subscriber entirely (raw eprintln! + explicit
+// flush) so a step is visible even if RUST_LOG/tracing init itself is the thing failing.
+// Remove once the silent-exit root cause is confirmed and fixed.
+macro_rules! breadcrumb {
+    ($($arg:tt)*) => {{
+        eprintln!("[startup] {}", format!($($arg)*));
+        let _ = std::io::stderr().flush();
+    }};
+}
+
 #[tokio::main]
 async fn main() {
+    breadcrumb!("main() entered");
+
     tracing_subscriber::fmt::init();
+    breadcrumb!("tracing_subscriber initialized");
 
     let data_dir = std::env::var("PLASTE_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     let chunks_dir = std::path::Path::new(&data_dir).join("chunks");
+    breadcrumb!("data_dir resolved: {data_dir}");
     storage::ensure_dir(std::path::Path::new(&data_dir)).await;
     storage::ensure_dir(&chunks_dir).await;
+    breadcrumb!("data/chunks dirs ensured");
 
     let db = db::init(&data_dir).await;
+    breadcrumb!("db::init (hiqlite) returned");
     audit::init_schema(&db).await;
     comments::init_schema(&db).await;
     tags::init_schema(&db).await;
@@ -21,14 +39,17 @@ async fn main() {
     tiering::init_schema(&db).await;
     tus::init_schema(&db).await;
     storage_backends::init_schema(&db).await;
+    breadcrumb!("all init_schema calls returned");
 
     let fts_dir = std::path::Path::new(&data_dir).join("fts_index");
     let fts = plaste::fulltext::FullTextIndex::open_or_create(&fts_dir).expect("open fts index");
+    breadcrumb!("fulltext index opened");
 
     let cold_root = std::path::Path::new(&data_dir).join("chunks_cold");
     storage::ensure_dir(&cold_root).await;
     let cold_op = storage::ChunkStore::new_fs_cold(&cold_root);
     let chunk_store = storage::ChunkStore::from_env().with_tiering(cold_op, db.clone());
+    breadcrumb!("chunk store constructed");
 
     // Admin-configurable storage backends (storage_backends.rs): if the DB already has an
     // active backend row, that's the source of truth — swap the just-built (from_env) hot
@@ -67,6 +88,7 @@ async fn main() {
             .expect("persist bootstrap storage backend row");
         }
     }
+    breadcrumb!("storage backend activation resolved");
 
     let state = AppState {
         db,
@@ -76,6 +98,7 @@ async fn main() {
     };
 
     auth::bootstrap_admin(&state).await;
+    breadcrumb!("auth::bootstrap_admin returned");
 
     // ponytail: fixed 1h cadence, not configurable; add a config knob if ops ever need finer control.
     let retention_state = state.clone();
@@ -154,32 +177,41 @@ async fn main() {
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
         );
+    breadcrumb!("router built");
 
     let port = std::env::var("PLASTE_PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
 
     let tls_paths = std::env::var("PLASTE_TLS_CERT").ok().zip(std::env::var("PLASTE_TLS_KEY").ok());
+    breadcrumb!("tls_paths resolved: {}", tls_paths.is_some());
     match tls_paths {
         Some((cert, key)) => {
             tracing::info!("listening on {addr} (TLS enabled)");
+            breadcrumb!("loading TLS cert/key from {cert} / {key}");
             let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
                 .await
                 .expect("load TLS cert/key");
+            breadcrumb!("TLS config loaded");
             let socket_addr: std::net::SocketAddr = addr.parse().expect("valid addr");
+            breadcrumb!("about to bind_rustls on {socket_addr}");
             axum_server::bind_rustls(socket_addr, config)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await
                 .expect("server");
+            breadcrumb!("bind_rustls .serve() returned — should never happen");
         }
         None => {
             tracing::info!("listening on {addr} (plain HTTP)");
+            breadcrumb!("about to TcpListener::bind on {addr}");
             let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
+            breadcrumb!("TcpListener bound, about to axum::serve");
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
             .expect("server");
+            breadcrumb!("axum::serve returned — should never happen");
         }
     }
 }

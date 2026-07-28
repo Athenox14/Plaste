@@ -22,7 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/files/{id}/preview", get(preview))
         .route("/files/{id}/versions", get(list_versions))
         .route("/files/{id}/restore", post(restore))
-        .route("/files/{id}", axum::routing::delete(delete_file))
+        .route("/files/{id}", axum::routing::delete(delete_file).patch(update_file))
         .route("/files/{id}/signature", get(signature))
         .route("/files/{id}/upload-delta", post(upload_delta))
 }
@@ -1268,4 +1268,265 @@ async fn delete_file(
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
     crate::audit::log(&state.db, ctx.id, "file.delete", Some("file"), Some(file.id), None).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- rename / move ----------
+
+/// Serde helper for the `folder_id` field of `PATCH /files/{id}` (and `PATCH /folders/{id}`'s
+/// `parent_id`): distinguishes a JSON field that's entirely omitted (`None`, "leave unchanged")
+/// from one explicitly present as `null` (`Some(None)`, "move to root") or a concrete id
+/// (`Some(Some(id))`). Plain `Option<T>` can't tell "omitted" from "null"; pairing this with
+/// `#[serde(default, deserialize_with = "deserialize_some")]` gets that distinction from
+/// ordinary JSON, no client-side tricks required.
+pub(crate) fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+struct UpdateFileReq {
+    name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    folder_id: Option<Option<i64>>,
+}
+
+#[derive(Serialize)]
+struct FileUpdateResp {
+    id: i64,
+    name: String,
+    folder_id: Option<i64>,
+}
+
+struct DeletedAtRow {
+    deleted_at: Option<String>,
+}
+impl From<&mut hiqlite::Row<'_>> for DeletedAtRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self { deleted_at: row.get("deleted_at") }
+    }
+}
+
+async fn update_file(
+    State(state): State<AppState>,
+    ctx: TokenCtx,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateFileReq>,
+) -> Result<Json<FileUpdateResp>, ApiErr> {
+    let file = get_owned_file(&state, &ctx, id, Action::Write).await?;
+
+    let current_folder_id: Option<i64> = state
+        .db
+        .query_raw_one("SELECT folder_id FROM files WHERE id = $1", params!(file.id))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?
+        .get("folder_id");
+
+    let folder_changing = req.folder_id.is_some();
+    let target_folder_id = req.folder_id.unwrap_or(current_folder_id);
+
+    if folder_changing {
+        if let Some(target) = target_folder_id {
+            let target_row: Option<DeletedAtRow> = state
+                .db
+                .query_map_optional("SELECT deleted_at FROM folders WHERE id = $1", params!(target))
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+            match target_row {
+                None => return Err((StatusCode::NOT_FOUND, "target folder not found")),
+                Some(r) if r.deleted_at.is_some() => {
+                    return Err((StatusCode::NOT_FOUND, "target folder not found"))
+                }
+                _ => {}
+            }
+            if !acl::check_access(&state.db, &ctx, "folder", target, Action::Write).await {
+                return Err((StatusCode::NOT_FOUND, "target folder not found"));
+            }
+        }
+    }
+
+    let new_name = req.name.clone().unwrap_or_else(|| file.name.clone());
+
+    if req.name.is_some() || folder_changing {
+        // Same name+folder_id+owner matching as upload's find-or-create, minus the current file.
+        let collision: Option<IdRow> = match target_folder_id {
+            Some(fid) => {
+                state
+                    .db
+                    .query_map_optional(
+                        "SELECT id FROM files WHERE name = $1 AND folder_id = $2 AND owner_token_id = $3 \
+                         AND deleted_at IS NULL AND id != $4",
+                        params!(&new_name, fid, file.owner_token_id, file.id),
+                    )
+                    .await
+            }
+            None => {
+                state
+                    .db
+                    .query_map_optional(
+                        "SELECT id FROM files WHERE name = $1 AND folder_id IS NULL AND owner_token_id = $2 \
+                         AND deleted_at IS NULL AND id != $3",
+                        params!(&new_name, file.owner_token_id, file.id),
+                    )
+                    .await
+            }
+        }
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+        if collision.is_some() {
+            return Err((StatusCode::CONFLICT, "a file with that name already exists in the target folder"));
+        }
+    }
+
+    state
+        .db
+        .execute(
+            "UPDATE files SET name = $1, folder_id = $2 WHERE id = $3",
+            params!(&new_name, target_folder_id, file.id),
+        )
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+
+    crate::audit::log(
+        &state.db,
+        ctx.id,
+        "file.rename_or_move",
+        Some("file"),
+        Some(file.id),
+        Some(&new_name),
+    )
+    .await;
+
+    Ok(Json(FileUpdateResp { id: file.id, name: new_name, folder_id: target_folder_id }))
+}
+
+#[cfg(test)]
+mod rename_move_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn setup() -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::init(dir.path().to_str().unwrap()).await;
+        init_schema(&db).await;
+        crate::audit::init_schema(&db).await;
+        let storage_dir = dir.path().join("chunks");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let fts_dir = dir.path().join("fts_index");
+        let fts = crate::fulltext::FullTextIndex::open_or_create(&fts_dir).unwrap();
+        let state = AppState {
+            db,
+            storage: std::sync::Arc::new(crate::storage::ChunkStore::new(storage_dir)),
+            chunks_dir: dir.path().join("chunks"),
+            fts: std::sync::Arc::new(fts),
+        };
+        (state, dir)
+    }
+
+    async fn make_token(db: &hiqlite::Client) -> (i64, String) {
+        let token = uuid::Uuid::new_v4().to_string();
+        let row: IdRow = db
+            .execute_returning_map_one(
+                "INSERT INTO tokens (token, owner, quota_bytes, created_at) VALUES ($1, 'u', 999999999, $2) RETURNING id",
+                params!(&token, chrono::Utc::now().to_rfc3339()),
+            )
+            .await
+            .unwrap();
+        (row.id, token)
+    }
+
+    async fn make_file(state: &AppState, owner: i64, name: &str, folder_id: Option<i64>) -> i64 {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let file: IdRow = state
+            .db
+            .execute_returning_map_one(
+                "INSERT INTO files (folder_id, name, owner_token_id, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+                params!(folder_id, name, owner, created_at),
+            )
+            .await
+            .unwrap();
+        file.id
+    }
+
+    async fn make_folder(state: &AppState, owner: i64, name: &str) -> i64 {
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let row: IdRow = state
+            .db
+            .execute_returning_map_one(
+                "INSERT INTO folders (parent_id, name, owner_token_id, created_at) VALUES (NULL, $1, $2, $3) RETURNING id",
+                params!(name, owner, created_at),
+            )
+            .await
+            .unwrap();
+        row.id
+    }
+
+    async fn patch_file(app: &Router, token: &str, id: i64, body: &str) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/files/{id}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn rename_file_name_only_persists() {
+        let (state, _dir) = setup().await;
+        let (owner, token) = make_token(&state.db).await;
+        let file_id = make_file(&state, owner, "old.txt", None).await;
+        let app = router().with_state(state);
+
+        let (status, json) = patch_file(&app, &token, file_id, r#"{"name":"new.txt"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["name"], "new.txt");
+        assert_eq!(json["folder_id"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn move_file_to_different_folder_only() {
+        let (state, _dir) = setup().await;
+        let (owner, token) = make_token(&state.db).await;
+        let folder_id = make_folder(&state, owner, "target").await;
+        let file_id = make_file(&state, owner, "a.txt", None).await;
+        let app = router().with_state(state);
+
+        let (status, json) = patch_file(&app, &token, file_id, &format!(r#"{{"folder_id":{folder_id}}}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["name"], "a.txt");
+        assert_eq!(json["folder_id"], folder_id);
+    }
+
+    #[tokio::test]
+    async fn rename_file_colliding_with_existing_name_in_target_returns_409() {
+        let (state, _dir) = setup().await;
+        let (owner, token) = make_token(&state.db).await;
+        let folder_id = make_folder(&state, owner, "target").await;
+        let _existing = make_file(&state, owner, "taken.txt", Some(folder_id)).await;
+        let file_id = make_file(&state, owner, "mine.txt", None).await;
+        let app = router().with_state(state);
+
+        let (status, _json) = patch_file(
+            &app,
+            &token,
+            file_id,
+            &format!(r#"{{"name":"taken.txt","folder_id":{folder_id}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
 }

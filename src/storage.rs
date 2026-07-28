@@ -39,6 +39,25 @@ pub struct ChunkStore {
     db: Option<hiqlite::Client>,
 }
 
+/// A `storage_backends` row's routing-relevant columns (id + how to build its `Operator`).
+/// Used by `ChunkStore`'s shard/replica routing (`active_backends_by_role`/`locations_for`).
+struct BackendCfgRow {
+    id: i64,
+    kind: String,
+    config: String,
+}
+impl From<&mut hiqlite::Row<'_>> for BackendCfgRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self { id: row.get("id"), kind: row.get("kind"), config: row.get("config") }
+    }
+}
+impl BackendCfgRow {
+    fn config_json(&self) -> std::io::Result<serde_json::Value> {
+        serde_json::from_str(&self.config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("backend {} config corrupt: {e}", self.id)))
+    }
+}
+
 impl ChunkStore {
     /// Local-disk backend rooted at `root` (opendal `services::Fs`).
     pub fn new_fs(root: impl Into<PathBuf>) -> Self {
@@ -80,6 +99,15 @@ impl ChunkStore {
     /// a strict opt-in and every current caller is unaffected.
     pub fn with_tiering(mut self, cold: Operator, db: hiqlite::Client) -> Self {
         self.cold = Some(cold);
+        self.db = Some(db);
+        self
+    }
+
+    /// Attaches just a db handle (no cold tier), enabling the multi-backend shard/replica
+    /// routing below (it needs to query `storage_backends`/`chunk_locations`) without opting
+    /// into hot/cold tiering. `with_tiering` also sets `db`, so a store built via that path
+    /// already gets shard/replica routing for free.
+    pub fn with_db(mut self, db: hiqlite::Client) -> Self {
         self.db = Some(db);
         self
     }
@@ -198,16 +226,38 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// Shared per-chunk body (dedup-check, encrypt, write blob, tiering bookkeeping) used by
-    /// both `write` (CDC-splits a whole buffer) and `write_single_chunk` (already-hashed
-    /// chunk from the client dedup-aware upload path, see chunk_upload.rs). Caller is
-    /// responsible for `hash` actually matching `bytes` (verified at the HTTP boundary for
-    /// the single-chunk path; always true for `write` since it computes the hash itself).
-    async fn write_chunk_bytes(&self, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let path = self.path_for(hash);
-        // Dedup check is against the plaintext-hash key, same as before encryption was
-        // added; only encrypt (with a fresh random nonce) if this content is new.
-        if !self.op().exists(&path).await.map_err(to_io_err)? {
+    /// Active `storage_backends` rows for a given role (`"shard"` / `"replica"` / `"primary"`).
+    /// Empty (not an error) when there's no db attached (stores built without `with_tiering`/
+    /// `with_db`) — those stores are the legacy single-hot-backend path unconditionally.
+    async fn active_backends_by_role(&self, role: &str) -> Vec<BackendCfgRow> {
+        let Some(db) = &self.db else { return Vec::new() };
+        db.query_map(
+            "SELECT id, kind, config FROM storage_backends WHERE role = $1 AND is_active = 1 ORDER BY id",
+            hiqlite::params!(role),
+        )
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The `chunk_locations` rows recorded for `hash`, joined with their backend's kind/config
+    /// (whatever's needed to build an `Operator` for each). Empty for legacy chunks (written
+    /// before this feature existed, or written while only a plain `primary` backend was active).
+    async fn locations_for(&self, hash: &str) -> Vec<BackendCfgRow> {
+        let Some(db) = &self.db else { return Vec::new() };
+        db.query_map(
+            "SELECT sb.id AS id, sb.kind AS kind, sb.config AS config FROM chunk_locations cl \
+             JOIN storage_backends sb ON sb.id = cl.backend_id WHERE cl.hash = $1 ORDER BY cl.created_at",
+            hiqlite::params!(hash),
+        )
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Dedup-checks (against `op` specifically), encrypts if new, and writes the blob to `op`
+    /// at `path`. Factored out of `write_chunk_bytes` so shard/replica routing can target
+    /// arbitrary on-the-fly-built operators without duplicating the encrypt/dedup logic.
+    async fn write_encrypted(&self, op: &Operator, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if !op.exists(path).await.map_err(to_io_err)? {
             let (key_id, ciphertext, nonce) = {
                 let keyring = self.keyring.lock().unwrap();
                 let (key_id, cipher) = keyring.current();
@@ -221,17 +271,94 @@ impl ChunkStore {
             stored.extend_from_slice(&pad_id(&key_id));
             stored.extend_from_slice(&nonce);
             stored.extend_from_slice(&ciphertext);
-            self.op().write(&path, stored).await.map_err(to_io_err)?;
+            op.write(path, stored).await.map_err(to_io_err)?;
         }
+        Ok(())
+    }
+
+    /// Shared per-chunk body (dedup-check, encrypt, write blob, routing, tiering bookkeeping)
+    /// used by both `write` (CDC-splits a whole buffer) and `write_single_chunk` (already-hashed
+    /// chunk from the client dedup-aware upload path, see chunk_upload.rs). Caller is
+    /// responsible for `hash` actually matching `bytes` (verified at the HTTP boundary for
+    /// the single-chunk path; always true for `write` since it computes the hash itself).
+    ///
+    /// Routing (multi-disk shard/replica support): if any active `shard`-role backends exist,
+    /// the chunk is routed to exactly one of them, picked deterministically from the hash so
+    /// repeated writes of the same content always land on the same shard as long as the shard
+    /// *set* doesn't change (ponytail: resharding on shard-set-change isn't handled — existing
+    /// chunks stay wherever they were originally routed; a real rebalance operation is out of
+    /// scope). With no shard backends active, behavior is unchanged: the single hot `Operator`.
+    /// Independently, if any active `replica`-role backends exist, the same bytes are ALSO
+    /// written to all of them (best-effort: a failed replica write is logged and skipped, not
+    /// fatal — availability-over-consistency, since the point of replicas is redundancy, not
+    /// an all-or-nothing transaction). Every backend the chunk actually landed on gets a
+    /// `chunk_locations` row, which is what the read path uses to find it again.
+    async fn write_chunk_bytes(&self, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let path = self.path_for(hash);
+        let shard_backends = self.active_backends_by_role("shard").await;
+        let replica_backends = self.active_backends_by_role("replica").await;
+
+        let mut location_ids: Vec<i64> = Vec::new();
+        let mut used_shard_or_replica = false;
+
+        if !shard_backends.is_empty() {
+            used_shard_or_replica = true;
+            let idx = (hash.as_bytes()[0] as usize) % shard_backends.len();
+            let target = &shard_backends[idx];
+            let op = Self::build_operator(&target.kind, &target.config_json()?)?;
+            self.write_encrypted(&op, &path, bytes).await?;
+            location_ids.push(target.id);
+        } else {
+            self.write_encrypted(&self.op(), &path, bytes).await?;
+            // If there's an active `primary`-role row tracked in storage_backends (the normal
+            // case once an admin has ever used this API — see main.rs's bootstrap), record it
+            // as this chunk's location too, so replica fan-out below has something to pair it
+            // with. No row (a store with no db attached, or db attached but no primary row
+            // ever inserted) just means no location gets recorded for it — purely legacy.
+            if let Some(primary) = self.active_backends_by_role("primary").await.into_iter().next() {
+                location_ids.push(primary.id);
+            }
+        }
+
+        if !replica_backends.is_empty() {
+            used_shard_or_replica = true;
+            for replica in &replica_backends {
+                let result = async {
+                    let cfg = replica.config_json()?;
+                    let op = Self::build_operator(&replica.kind, &cfg)?;
+                    self.write_encrypted(&op, &path, bytes).await
+                }
+                .await;
+                match result {
+                    Ok(()) => location_ids.push(replica.id),
+                    Err(e) => tracing::warn!("replica backend {} write failed for chunk {hash}: {e}", replica.id),
+                }
+            }
+        }
+
         if let Some(db) = &self.db {
             let now = chrono::Utc::now().to_rfc3339();
-            let _ = db
-                .execute(
-                    "INSERT INTO chunk_access (hash, tier, last_accessed) VALUES ($1, 'hot', $2) \
-                     ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2",
-                    hiqlite::params!(hash.to_string(), now),
-                )
-                .await;
+            for id in &location_ids {
+                let _ = db
+                    .execute(
+                        "INSERT OR IGNORE INTO chunk_locations (hash, backend_id, created_at) VALUES ($1, $2, $3)",
+                        hiqlite::params!(hash.to_string(), *id, now.clone()),
+                    )
+                    .await;
+            }
+            // Tiering bookkeeping (chunk_access) only applies to the legacy single-hot-backend
+            // path: once a chunk is shard/replica routed, hot/cold tiering (which only ever
+            // reads/writes via `self.op()`) can't reach it anyway, so recording it there would
+            // just confuse the tiering sweep. Unchanged behavior for plain-primary stores.
+            if !used_shard_or_replica {
+                let _ = db
+                    .execute(
+                        "INSERT INTO chunk_access (hash, tier, last_accessed) VALUES ($1, 'hot', $2) \
+                         ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2",
+                        hiqlite::params!(hash.to_string(), now),
+                    )
+                    .await;
+            }
         }
         Ok(())
     }
@@ -278,38 +405,7 @@ impl ChunkStore {
     pub async fn read_manifest(&self, manifest: &[String]) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         for hash in manifest {
-            let tier = self.tier_of(hash).await;
-            let path = self.path_for(hash);
-            let buf = if tier == "cold" {
-                let cold = self.cold.as_ref().expect("chunk_access says cold but no cold tier attached");
-                let bytes = cold.read(&path).await.map_err(to_io_err)?.to_vec();
-                // Promote back to hot on read: realistic tiering behavior — data that's
-                // re-accessed after going cold is likely to be accessed again soon.
-                self.op().write(&path, bytes.clone()).await.map_err(to_io_err)?;
-                let _ = cold.delete(&path).await;
-                if let Some(db) = &self.db {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = db
-                        .execute(
-                            "UPDATE chunk_access SET tier = 'hot', last_accessed = $1 WHERE hash = $2",
-                            hiqlite::params!(now, hash.clone()),
-                        )
-                        .await;
-                }
-                bytes
-            } else {
-                let bytes = self.op().read(&path).await.map_err(to_io_err)?.to_vec();
-                if let Some(db) = &self.db {
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let _ = db
-                        .execute(
-                            "UPDATE chunk_access SET last_accessed = $1 WHERE hash = $2",
-                            hiqlite::params!(now, hash.clone()),
-                        )
-                        .await;
-                }
-                bytes
-            };
+            let buf = self.read_chunk_encrypted(hash).await?;
             if buf.len() < KEY_ID_LEN + NONCE_LEN {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -337,6 +433,77 @@ impl ChunkStore {
             out.extend_from_slice(&plaintext);
         }
         Ok(out)
+    }
+
+    /// Reads a chunk's encrypted bytes, routing through `chunk_locations` when rows exist
+    /// (shard/replica-written chunks): tries each recorded backend in order (shard/primary
+    /// location first, then replicas) until one succeeds, so a replica going unreachable
+    /// doesn't fail the read as long as another copy is reachable. Falls back to the plain
+    /// hot-`Operator`/tiering path (unchanged from before this feature existed) when there are
+    /// no `chunk_locations` rows for this hash — the legacy-chunk / plain-primary-mode case.
+    async fn read_chunk_encrypted(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        let locations = self.locations_for(hash).await;
+        if locations.is_empty() {
+            return self.read_legacy(hash).await;
+        }
+        let path = self.path_for(hash);
+        let mut last_err: Option<std::io::Error> = None;
+        for loc in &locations {
+            let attempt = async {
+                let cfg = loc.config_json()?;
+                let op = Self::build_operator(&loc.kind, &cfg)?;
+                op.read(&path).await.map(|b| b.to_vec()).map_err(to_io_err)
+            }
+            .await;
+            match attempt {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "chunk {hash}: all {} known location(s) failed to read; last error: {}",
+                locations.len(),
+                last_err.map(|e| e.to_string()).unwrap_or_else(|| "none".to_string())
+            ),
+        ))
+    }
+
+    /// The pre-multi-backend read path: hot/cold tiering via `self.op()`/`self.cold`, unchanged.
+    async fn read_legacy(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        let tier = self.tier_of(hash).await;
+        let path = self.path_for(hash);
+        if tier == "cold" {
+            let cold = self.cold.as_ref().expect("chunk_access says cold but no cold tier attached");
+            let bytes = cold.read(&path).await.map_err(to_io_err)?.to_vec();
+            // Promote back to hot on read: realistic tiering behavior — data that's
+            // re-accessed after going cold is likely to be accessed again soon.
+            self.op().write(&path, bytes.clone()).await.map_err(to_io_err)?;
+            let _ = cold.delete(&path).await;
+            if let Some(db) = &self.db {
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = db
+                    .execute(
+                        "UPDATE chunk_access SET tier = 'hot', last_accessed = $1 WHERE hash = $2",
+                        hiqlite::params!(now, hash.to_string()),
+                    )
+                    .await;
+            }
+            Ok(bytes)
+        } else {
+            let bytes = self.op().read(&path).await.map_err(to_io_err)?.to_vec();
+            if let Some(db) = &self.db {
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = db
+                    .execute(
+                        "UPDATE chunk_access SET last_accessed = $1 WHERE hash = $2",
+                        hiqlite::params!(now, hash.to_string()),
+                    )
+                    .await;
+            }
+            Ok(bytes)
+        }
     }
 
     /// Migrates chunks not read in `cold_after_days` days from hot to cold storage. Returns
@@ -389,12 +556,44 @@ impl ChunkStore {
     }
 
     pub async fn chunk_exists(&self, hash: &str) -> std::io::Result<bool> {
-        self.op().exists(&self.path_for(hash)).await.map_err(to_io_err)
+        let locations = self.locations_for(hash).await;
+        if locations.is_empty() {
+            return self.op().exists(&self.path_for(hash)).await.map_err(to_io_err);
+        }
+        let path = self.path_for(hash);
+        for loc in &locations {
+            if let Ok(cfg) = loc.config_json() {
+                if let Ok(op) = Self::build_operator(&loc.kind, &cfg) {
+                    if op.exists(&path).await.unwrap_or(false) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
-    /// Removes a chunk blob from storage. Missing blob is not an error (already gone).
+    /// Removes a chunk blob from storage. Missing blob is not an error (already gone). For a
+    /// shard/replica-routed chunk, deletes from every recorded location (best-effort) and
+    /// clears its `chunk_locations` rows; falls back to the single hot `Operator` for legacy
+    /// chunks with no recorded locations, same as before this feature existed.
     pub async fn delete_chunk(&self, hash: &str) -> std::io::Result<()> {
-        self.op().delete(&self.path_for(hash)).await.map_err(to_io_err)
+        let locations = self.locations_for(hash).await;
+        if locations.is_empty() {
+            return self.op().delete(&self.path_for(hash)).await.map_err(to_io_err);
+        }
+        let path = self.path_for(hash);
+        for loc in &locations {
+            if let Ok(cfg) = loc.config_json() {
+                if let Ok(op) = Self::build_operator(&loc.kind, &cfg) {
+                    let _ = op.delete(&path).await;
+                }
+            }
+        }
+        if let Some(db) = &self.db {
+            let _ = db.execute("DELETE FROM chunk_locations WHERE hash = $1", hiqlite::params!(hash.to_string())).await;
+        }
+        Ok(())
     }
 
     /// Rotates the master keyring: generates a new key, makes it current for all future
@@ -547,5 +746,189 @@ mod tests {
         let hash_b = manifest_b[0].clone();
         assert!(dir_b.path().join(&hash_b[0..2]).join(&hash_b).exists(), "post-activation write should land in new backend");
         assert!(!dir_a.path().join(&hash_b[0..2]).join(&hash_b).exists(), "post-activation write should NOT land in old backend");
+    }
+
+    // ---------- multi-backend shard/replica routing ----------
+
+    async fn insert_backend(db: &hiqlite::Client, name: &str, path: &std::path::Path, role: &str) -> i64 {
+        let config = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+        let row: crate::db::IdRow = db
+            .execute_returning_map_one(
+                "INSERT INTO storage_backends (name, kind, config, role, is_active, created_at) VALUES ($1, 'fs', $2, $3, 1, $4) RETURNING id",
+                hiqlite::params!(name, config, role, chrono::Utc::now().to_rfc3339()),
+            )
+            .await
+            .unwrap();
+        row.id
+    }
+
+    async fn setup_store_with_db() -> (ChunkStore, hiqlite::Client, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::init(dir.path().to_str().unwrap()).await;
+        crate::storage_backends::init_schema(&db).await;
+        let primary_dir = dir.path().join("primary");
+        tokio::fs::create_dir_all(&primary_dir).await.unwrap();
+        let store = ChunkStore::new_fs(&primary_dir).with_db(db.clone());
+        (store, db, dir)
+    }
+
+    #[tokio::test]
+    async fn shard_routing_spreads_chunks_and_reads_back_correctly() {
+        let (store, db, dir) = setup_store_with_db().await;
+        let shard_a = dir.path().join("shard_a");
+        let shard_b = dir.path().join("shard_b");
+        tokio::fs::create_dir_all(&shard_a).await.unwrap();
+        tokio::fs::create_dir_all(&shard_b).await.unwrap();
+        insert_backend(&db, "shard-a", &shard_a, "shard").await;
+        insert_backend(&db, "shard-b", &shard_b, "shard").await;
+
+        // Enough distinct chunks that both shards are exercised (each write is its own
+        // dedup'd content, so each gets independently hashed/routed).
+        let mut manifests = Vec::new();
+        for i in 0..12 {
+            let data = format!("shard test payload number {i} with some distinguishing content").into_bytes();
+            let (manifest, _) = store.write(&data).await.unwrap();
+            manifests.push((manifest, data));
+        }
+
+        struct LocRow {
+            backend_id: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for LocRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { backend_id: row.get("backend_id") }
+            }
+        }
+        let mut distinct_backends = std::collections::HashSet::new();
+        for (manifest, _) in &manifests {
+            for hash in manifest {
+                let rows: Vec<LocRow> = db
+                    .query_map("SELECT backend_id FROM chunk_locations WHERE hash = $1", hiqlite::params!(hash))
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "shard-only chunk should have exactly one location row");
+                distinct_backends.insert(rows[0].backend_id);
+            }
+        }
+        assert_eq!(distinct_backends.len(), 2, "both shards should have been used across this many chunks");
+
+        for (manifest, data) in &manifests {
+            let read_back = store.read_manifest(manifest).await.unwrap();
+            assert_eq!(&read_back, data, "read-back must be byte-correct regardless of which shard it landed on");
+        }
+    }
+
+    #[tokio::test]
+    async fn replica_routing_survives_one_replica_going_missing() {
+        let (store, db, dir) = setup_store_with_db().await;
+        let primary_dir = dir.path().join("primary");
+        let replica_a = dir.path().join("replica_a");
+        let replica_b = dir.path().join("replica_b");
+        tokio::fs::create_dir_all(&replica_a).await.unwrap();
+        tokio::fs::create_dir_all(&replica_b).await.unwrap();
+        // Register the store's own hot backend as a tracked `primary` row too, so its writes
+        // also get a chunk_locations row (the realistic case once storage_backends has ever
+        // been used via the admin API — see main.rs's bootstrap-row behavior).
+        insert_backend(&db, "primary", &primary_dir, "primary").await;
+        insert_backend(&db, "replica-a", &replica_a, "replica").await;
+        insert_backend(&db, "replica-b", &replica_b, "replica").await;
+
+        let data = b"replicated chunk data that must survive one disk vanishing".to_vec();
+        let (manifest, _) = store.write(&data).await.unwrap();
+        let hash = &manifest[0];
+
+        struct LocRow {
+            backend_id: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for LocRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { backend_id: row.get("backend_id") }
+            }
+        }
+        let rows: Vec<LocRow> = db
+            .query_map("SELECT backend_id FROM chunk_locations WHERE hash = $1", hiqlite::params!(hash))
+            .await
+            .unwrap();
+        // No shard backends active, so the primary path also gets a location row alongside
+        // both replicas: 3 locations total (primary + replica-a + replica-b).
+        assert_eq!(rows.len(), 3, "expected primary + 2 replica locations");
+
+        // Confirm the chunk actually landed in both replica directories on disk.
+        let rel_path = format!("{}/{hash}", &hash[0..2]);
+        assert!(replica_a.join(&rel_path).exists(), "chunk should be in replica-a");
+        assert!(replica_b.join(&rel_path).exists(), "chunk should be in replica-b");
+
+        // Simulate replica-a's disk becoming unavailable by deleting its blob directly.
+        tokio::fs::remove_file(replica_a.join(&rel_path)).await.unwrap();
+
+        let read_back = store.read_manifest(&manifest).await.unwrap();
+        assert_eq!(read_back, data, "read must still succeed via replica-b (or primary) after replica-a vanishes");
+    }
+
+    #[tokio::test]
+    async fn legacy_chunk_with_no_location_rows_falls_back_to_hot_operator() {
+        let (store, db, _dir) = setup_store_with_db().await;
+
+        // Write with no shard/replica backends configured at all: pure legacy path, no
+        // chunk_locations rows recorded (matches behavior before this feature existed).
+        let data = b"legacy pre-feature chunk, no chunk_locations row".to_vec();
+        let (manifest, _) = store.write(&data).await.unwrap();
+        let hash = &manifest[0];
+
+        struct CountRow {
+            n: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for CountRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { n: row.get("n") }
+            }
+        }
+        let rows: Vec<CountRow> = db
+            .query_map("SELECT COUNT(*) as n FROM chunk_locations WHERE hash = $1", hiqlite::params!(hash))
+            .await
+            .unwrap();
+        assert_eq!(rows[0].n, 0, "plain-primary-mode write should leave no chunk_locations rows");
+
+        let read_back = store.read_manifest(&manifest).await.unwrap();
+        assert_eq!(read_back, data, "must still read correctly via hot-Operator fallback");
+    }
+
+    #[tokio::test]
+    async fn mixed_shard_and_replica_active_simultaneously_compose_correctly() {
+        let (store, db, dir) = setup_store_with_db().await;
+        let shard_dir = dir.path().join("mixed_shard");
+        let replica_dir = dir.path().join("mixed_replica");
+        tokio::fs::create_dir_all(&shard_dir).await.unwrap();
+        tokio::fs::create_dir_all(&replica_dir).await.unwrap();
+        let shard_id = insert_backend(&db, "mixed-shard", &shard_dir, "shard").await;
+        let replica_id = insert_backend(&db, "mixed-replica", &replica_dir, "replica").await;
+
+        let data = b"mixed mode chunk: one shard, one replica, both active".to_vec();
+        let (manifest, _) = store.write(&data).await.unwrap();
+        let hash = &manifest[0];
+
+        struct LocRow {
+            backend_id: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for LocRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { backend_id: row.get("backend_id") }
+            }
+        }
+        let rows: Vec<LocRow> = db
+            .query_map("SELECT backend_id FROM chunk_locations WHERE hash = $1", hiqlite::params!(hash))
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<i64> = rows.into_iter().map(|r| r.backend_id).collect();
+        assert!(ids.contains(&shard_id), "chunk should be recorded on its assigned shard");
+        assert!(ids.contains(&replica_id), "chunk should also be recorded on the replica");
+        assert_eq!(ids.len(), 2, "no unexpected extra locations (no active primary-role row in this test)");
+
+        let rel_path = format!("{}/{hash}", &hash[0..2]);
+        assert!(shard_dir.join(&rel_path).exists(), "chunk should physically be on the shard");
+        assert!(replica_dir.join(&rel_path).exists(), "chunk should also physically be on the replica");
+
+        let read_back = store.read_manifest(&manifest).await.unwrap();
+        assert_eq!(read_back, data);
     }
 }

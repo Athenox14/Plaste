@@ -22,16 +22,34 @@ use crate::{auth::{require_admin, TokenCtx}, db::IdRow, AppState};
 
 /// Own schema, run separately from db.rs's SCHEMA array (same pattern as tags.rs/tiering.rs).
 pub async fn init_schema(db: &hiqlite::Client) {
-    const SCHEMA: &[&str] = &[r#"CREATE TABLE IF NOT EXISTS storage_backends (
+    const SCHEMA: &[&str] = &[
+        r#"CREATE TABLE IF NOT EXISTS storage_backends (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT UNIQUE NOT NULL,
         kind TEXT NOT NULL,
         config TEXT NOT NULL,
         is_active INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
-    )"#];
+    )"#,
+        // Tracks exactly which backend(s) physically hold a given chunk. Multiple rows per
+        // hash means the chunk is replicated; one row means it's on a shard (or the primary,
+        // when replicas are also active). NO rows for a hash means it predates this feature
+        // (or was written while only a plain `primary` backend was active) — the read path
+        // falls back to the hot `Operator` for those, unchanged from before this table existed.
+        r#"CREATE TABLE IF NOT EXISTS chunk_locations (
+        hash TEXT NOT NULL,
+        backend_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(hash, backend_id)
+    )"#,
+    ];
     for stmt in SCHEMA {
         db.execute(*stmt, params!()).await.expect("storage_backends schema migration");
+    }
+    // ALTER, not part of a fresh CREATE TABLE, since this table predates the role concept
+    // (same ignore-duplicate-column pattern as db.rs's ALTERS).
+    if let Err(e) = db.execute("ALTER TABLE storage_backends ADD COLUMN role TEXT NOT NULL DEFAULT 'primary'", params!()).await {
+        tracing::debug!("skipping storage_backends.role ALTER (likely already applied): {e}");
     }
 }
 
@@ -40,6 +58,14 @@ pub fn router() -> Router<AppState> {
         .route("/admin/storage-backends", post(create_backend).get(list_backends))
         .route("/admin/storage-backends/{id}", axum::routing::delete(delete_backend))
         .route("/admin/storage-backends/{id}/activate", post(activate_backend))
+        .route("/admin/storage-backends/{id}/deactivate", post(deactivate_backend))
+}
+
+fn validate_role(role: &str) -> Result<(), &'static str> {
+    match role {
+        "primary" | "replica" | "shard" => Ok(()),
+        _ => Err("role must be 'primary', 'replica', or 'shard'"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -47,6 +73,12 @@ struct CreateBackendReq {
     name: String,
     kind: String,
     config: serde_json::Value,
+    #[serde(default = "default_role")]
+    role: String,
+}
+
+fn default_role() -> String {
+    "primary".to_string()
 }
 
 #[derive(Serialize)]
@@ -55,6 +87,7 @@ struct BackendResp {
     name: String,
     kind: String,
     config: serde_json::Value,
+    role: String,
     is_active: bool,
     created_at: String,
 }
@@ -64,6 +97,7 @@ struct BackendRow {
     name: String,
     kind: String,
     config: String,
+    role: String,
     is_active: bool,
     created_at: String,
 }
@@ -74,6 +108,7 @@ impl From<&mut hiqlite::Row<'_>> for BackendRow {
             name: row.get("name"),
             kind: row.get("kind"),
             config: row.get("config"),
+            role: row.get("role"),
             is_active: row.get::<i64>("is_active") != 0,
             created_at: row.get("created_at"),
         }
@@ -128,11 +163,14 @@ impl From<BackendRow> for BackendResp {
             name: r.name,
             config: redact_config(&r.kind, &r.config),
             kind: r.kind,
+            role: r.role,
             is_active: r.is_active,
             created_at: r.created_at,
         }
     }
 }
+
+const SELECT_BACKEND: &str = "SELECT id, name, kind, config, role, is_active, created_at FROM storage_backends";
 
 async fn create_backend(
     State(state): State<AppState>,
@@ -141,14 +179,15 @@ async fn create_backend(
 ) -> Result<Json<BackendResp>, (StatusCode, &'static str)> {
     require_admin(&ctx)?;
     validate_config(&req.kind, &req.config).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    validate_role(&req.role).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let config_str = serde_json::to_string(&req.config).map_err(|_| (StatusCode::BAD_REQUEST, "invalid config"))?;
     let created_at = chrono::Utc::now().to_rfc3339();
 
     let id_row: IdRow = state
         .db
         .execute_returning_map_one(
-            "INSERT INTO storage_backends (name, kind, config, is_active, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
-            params!(&req.name, &req.kind, &config_str, &created_at),
+            "INSERT INTO storage_backends (name, kind, config, role, is_active, created_at) VALUES ($1, $2, $3, $4, 0, $5) RETURNING id",
+            params!(&req.name, &req.kind, &config_str, &req.role, &created_at),
         )
         .await
         .map_err(|_| (StatusCode::CONFLICT, "backend name already exists or db error"))?;
@@ -160,6 +199,7 @@ async fn create_backend(
         name: req.name,
         config: redact_config(&req.kind, &config_str),
         kind: req.kind,
+        role: req.role,
         is_active: false,
         created_at,
     }))
@@ -172,7 +212,7 @@ async fn list_backends(
     require_admin(&ctx)?;
     let rows: Vec<BackendRow> = state
         .db
-        .query_map("SELECT id, name, kind, config, is_active, created_at FROM storage_backends", params!())
+        .query_map(SELECT_BACKEND, params!())
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
@@ -186,7 +226,7 @@ async fn delete_backend(
     require_admin(&ctx)?;
     let row: Option<BackendRow> = state
         .db
-        .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(id))
+        .query_map_optional(format!("{SELECT_BACKEND} WHERE id = $1"), params!(id))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
     let row = row.ok_or((StatusCode::NOT_FOUND, "backend not found"))?;
@@ -199,6 +239,12 @@ async fn delete_backend(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Activation semantics depend on role:
+/// - `primary`: unchanged existing behavior — single-active invariant (deactivates other
+///   primaries) and swaps the classic hot `Operator` used by the legacy write/read path.
+/// - `replica`/`shard`: additive — just flips `is_active` on this row. Multiple shards and
+///   replicas can be simultaneously active; `ChunkStore` reads the active set straight from
+///   `storage_backends` per-write/read (see storage.rs), no in-memory swap needed for these.
 async fn activate_backend(
     State(state): State<AppState>,
     ctx: TokenCtx,
@@ -207,20 +253,22 @@ async fn activate_backend(
     require_admin(&ctx)?;
     let row: Option<BackendRow> = state
         .db
-        .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(id))
+        .query_map_optional(format!("{SELECT_BACKEND} WHERE id = $1"), params!(id))
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
     let row = row.ok_or((StatusCode::NOT_FOUND, "backend not found"))?;
 
-    let config: serde_json::Value = serde_json::from_str(&row.config).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stored config corrupt"))?;
-    state
-        .storage
-        .activate_backend(&row.kind, &config)
-        .await
-        .map_err(|_| (StatusCode::BAD_REQUEST, "failed to build/activate backend (bad config?)"))?;
+    if row.role == "primary" {
+        let config: serde_json::Value = serde_json::from_str(&row.config).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "stored config corrupt"))?;
+        state
+            .storage
+            .activate_backend(&row.kind, &config)
+            .await
+            .map_err(|_| (StatusCode::BAD_REQUEST, "failed to build/activate backend (bad config?)"))?;
 
-    state.db.execute("UPDATE storage_backends SET is_active = 0", params!()).await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+        state.db.execute("UPDATE storage_backends SET is_active = 0 WHERE role = 'primary'", params!()).await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    }
     state.db.execute("UPDATE storage_backends SET is_active = 1 WHERE id = $1", params!(id)).await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
 
@@ -231,7 +279,39 @@ async fn activate_backend(
         name: row.name,
         config: redact_config(&row.kind, &row.config),
         kind: row.kind,
+        role: row.role,
         is_active: true,
+        created_at: row.created_at,
+    }))
+}
+
+/// Turns off a replica/shard backend without deleting its config. Works for any role for
+/// symmetry, but primary backends already had an implicit deactivate (activating a different
+/// primary) — this is mainly needed for replica/shard since those don't auto-deactivate.
+async fn deactivate_backend(
+    State(state): State<AppState>,
+    ctx: TokenCtx,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<BackendResp>, (StatusCode, &'static str)> {
+    require_admin(&ctx)?;
+    let row: Option<BackendRow> = state
+        .db
+        .query_map_optional(format!("{SELECT_BACKEND} WHERE id = $1"), params!(id))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    let row = row.ok_or((StatusCode::NOT_FOUND, "backend not found"))?;
+
+    state.db.execute("UPDATE storage_backends SET is_active = 0 WHERE id = $1", params!(id)).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    crate::audit::log(&state.db, ctx.id, "storage_backend.deactivate", Some("storage_backend"), Some(id), None).await;
+
+    Ok(Json(BackendResp {
+        id: row.id,
+        name: row.name,
+        config: redact_config(&row.kind, &row.config),
+        kind: row.kind,
+        role: row.role,
+        is_active: false,
         created_at: row.created_at,
     }))
 }

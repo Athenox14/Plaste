@@ -806,6 +806,8 @@ pub struct StorageBackend {
     /// JSON-encoded config, secrets redacted (mirrors REST's storage_backends.rs redaction —
     /// s3 access_key/secret_key never come back out over the API once stored).
     config: String,
+    /// `"primary"` (default), `"replica"`, or `"shard"` — see storage_backends.rs's module doc.
+    role: String,
     is_active: bool,
     created_at: String,
 }
@@ -815,6 +817,7 @@ struct StorageBackendRow {
     name: String,
     kind: String,
     config: String,
+    role: String,
     is_active: bool,
     created_at: String,
 }
@@ -825,9 +828,20 @@ impl From<&mut hiqlite::Row<'_>> for StorageBackendRow {
             name: row.get("name"),
             kind: row.get("kind"),
             config: row.get("config"),
+            role: row.get("role"),
             is_active: row.get::<i64>("is_active") != 0,
             created_at: row.get("created_at"),
         }
+    }
+}
+
+const GQL_SELECT_BACKEND: &str = "SELECT id, name, kind, config, role, is_active, created_at FROM storage_backends";
+
+/// Mirrors storage_backends.rs's `validate_role`.
+fn gql_validate_role(role: &str) -> GqlResult<()> {
+    match role {
+        "primary" | "replica" | "shard" => Ok(()),
+        _ => Err(async_graphql::Error::new("role must be 'primary', 'replica', or 'shard'")),
     }
 }
 
@@ -855,6 +869,7 @@ impl From<StorageBackendRow> for StorageBackend {
             name: r.name,
             config: gql_redact_config(&r.kind, &r.config),
             kind: r.kind,
+            role: r.role,
             is_active: r.is_active,
             created_at: r.created_at,
         }
@@ -1305,7 +1320,7 @@ impl Query {
         let state = gctx.data::<AppState>()?;
         let rows: Vec<StorageBackendRow> = state
             .db
-            .query_map("SELECT id, name, kind, config, is_active, created_at FROM storage_backends", params!())
+            .query_map(GQL_SELECT_BACKEND, params!())
             .await
             .map_err(gerr)?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -1396,6 +1411,150 @@ impl Mutation {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(true)
+    }
+
+    /// Mirrors PATCH /folders/{id} (folders.rs::update_folder). `parent_id` uses
+    /// `MaybeUndefined` (async-graphql's built-in "maybe undefined" input type — no precedent
+    /// for this elsewhere in the schema, so this introduces it) to distinguish an omitted
+    /// argument (leave `parent_id` unchanged) from an explicit `null` (move to root) vs a
+    /// concrete id (move under that folder). Same cycle-prevention and collision checks as the
+    /// REST handler.
+    async fn update_folder(
+        &self,
+        gctx: &Context<'_>,
+        id: ID,
+        name: Option<String>,
+        parent_id: async_graphql::MaybeUndefined<ID>,
+    ) -> GqlResult<Folder> {
+        let tok = ctx_of(gctx)?;
+        let state = gctx.data::<AppState>()?;
+        let fid = parse_id(&id)?;
+
+        let owner: Option<IdOwnerRow> = state
+            .db
+            .query_map_optional(
+                "SELECT owner_token_id FROM folders WHERE id = $1 AND deleted_at IS NULL",
+                params!(fid),
+            )
+            .await
+            .map_err(gerr)?;
+        let owner = owner.ok_or(async_graphql::Error::new("folder not found"))?;
+        if owner.owner_token_id != tok.id && !tok.is_admin {
+            return Err(async_graphql::Error::new("not owner"));
+        }
+
+        let np: FolderRow = state
+            .db
+            .query_map_optional(
+                "SELECT id, name, parent_id, created_at, owner_token_id FROM folders WHERE id = $1",
+                params!(fid),
+            )
+            .await
+            .map_err(gerr)?
+            .ok_or(async_graphql::Error::new("folder not found"))?;
+
+        let parent_changing = !parent_id.is_undefined();
+        let requested_parent: Option<i64> = match &parent_id {
+            async_graphql::MaybeUndefined::Value(v) => Some(parse_id(v)?),
+            async_graphql::MaybeUndefined::Null | async_graphql::MaybeUndefined::Undefined => None,
+        };
+        let target_parent_id = if parent_changing { requested_parent } else { np.parent_id };
+
+        if parent_changing {
+            if let Some(target) = target_parent_id {
+                if target == fid {
+                    return Err(async_graphql::Error::new("cannot move a folder into itself"));
+                }
+                // Cycle check: BFS the subtree, same shape as folders.rs::collect_with_descendants.
+                let mut all_ids = vec![fid];
+                let mut frontier = vec![fid];
+                while !frontier.is_empty() {
+                    let mut next_frontier = Vec::new();
+                    for parent in frontier {
+                        let children: Vec<IdRow> = state
+                            .db
+                            .query_map(
+                                "SELECT id FROM folders WHERE parent_id = $1 AND deleted_at IS NULL",
+                                params!(parent),
+                            )
+                            .await
+                            .map_err(gerr)?;
+                        for c in children {
+                            all_ids.push(c.id);
+                            next_frontier.push(c.id);
+                        }
+                    }
+                    frontier = next_frontier;
+                }
+                if all_ids.contains(&target) {
+                    return Err(async_graphql::Error::new("cannot move a folder into its own descendant"));
+                }
+                let target_owner: Option<IdOwnerRow> = state
+                    .db
+                    .query_map_optional(
+                        "SELECT owner_token_id FROM folders WHERE id = $1 AND deleted_at IS NULL",
+                        params!(target),
+                    )
+                    .await
+                    .map_err(gerr)?;
+                match target_owner {
+                    None => return Err(async_graphql::Error::new("target folder not found")),
+                    Some(o) if o.owner_token_id != tok.id && !tok.is_admin => {
+                        return Err(async_graphql::Error::new("not owner"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let new_name = name.clone().unwrap_or_else(|| np.name.clone());
+
+        if name.is_some() || parent_changing {
+            let collision: Option<IdRow> = match target_parent_id {
+                Some(pid) => {
+                    state
+                        .db
+                        .query_map_optional(
+                            "SELECT id FROM folders WHERE name = $1 AND parent_id = $2 AND owner_token_id = $3 \
+                             AND deleted_at IS NULL AND id != $4",
+                            params!(&new_name, pid, owner.owner_token_id, fid),
+                        )
+                        .await
+                }
+                None => {
+                    state
+                        .db
+                        .query_map_optional(
+                            "SELECT id FROM folders WHERE name = $1 AND parent_id IS NULL AND owner_token_id = $2 \
+                             AND deleted_at IS NULL AND id != $3",
+                            params!(&new_name, owner.owner_token_id, fid),
+                        )
+                        .await
+                }
+            }
+            .map_err(gerr)?;
+            if collision.is_some() {
+                return Err(async_graphql::Error::new("a folder with that name already exists under the target parent"));
+            }
+        }
+
+        state
+            .db
+            .execute(
+                "UPDATE folders SET name = $1, parent_id = $2 WHERE id = $3",
+                params!(&new_name, target_parent_id, fid),
+            )
+            .await
+            .map_err(gerr)?;
+
+        crate::audit::log(&state.db, tok.id, "folder.rename_or_move", Some("folder"), Some(fid), Some(&new_name)).await;
+
+        Ok(Folder {
+            id: ID(fid.to_string()),
+            name: new_name,
+            parent_id: target_parent_id.map(|p| ID(p.to_string())),
+            created_at: np.created_at,
+        })
     }
 
     /// Mirrors POST /admin/tokens (admin.rs::create_token).
@@ -2058,24 +2217,167 @@ impl Mutation {
         })
     }
 
+    /// Mirrors PATCH /files/{id} (files.rs::update_file). `folder_id` uses `MaybeUndefined`
+    /// (same convention introduced by `update_folder` above) to distinguish an omitted argument
+    /// (leave folder unchanged) from an explicit `null` (move to root) vs a concrete id.
+    async fn update_file(
+        &self,
+        gctx: &Context<'_>,
+        id: ID,
+        name: Option<String>,
+        folder_id: async_graphql::MaybeUndefined<ID>,
+    ) -> GqlResult<File> {
+        let tok = ctx_of(gctx)?;
+        let state = gctx.data::<AppState>()?;
+        let fid = parse_id(&id)?;
+
+        let exists: Option<IdRow> = state
+            .db
+            .query_map_optional("SELECT id FROM files WHERE id = $1 AND deleted_at IS NULL", params!(fid))
+            .await
+            .map_err(gerr)?;
+        if exists.is_none() {
+            return Err(async_graphql::Error::new("file not found"));
+        }
+        if !acl::check_access(&state.db, tok, "file", fid, acl::Action::Write).await {
+            return Err(async_graphql::Error::new("file not found"));
+        }
+
+        struct NameFolderOwnerRow {
+            name: String,
+            folder_id: Option<i64>,
+            owner_token_id: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for NameFolderOwnerRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self {
+                    name: row.get("name"),
+                    folder_id: row.get("folder_id"),
+                    owner_token_id: row.get("owner_token_id"),
+                }
+            }
+        }
+        let cur: NameFolderOwnerRow = state
+            .db
+            .query_map_optional(
+                "SELECT name, folder_id, owner_token_id FROM files WHERE id = $1",
+                params!(fid),
+            )
+            .await
+            .map_err(gerr)?
+            .ok_or(async_graphql::Error::new("file not found"))?;
+
+        let folder_changing = !folder_id.is_undefined();
+        let requested_folder: Option<i64> = match &folder_id {
+            async_graphql::MaybeUndefined::Value(v) => Some(parse_id(v)?),
+            async_graphql::MaybeUndefined::Null | async_graphql::MaybeUndefined::Undefined => None,
+        };
+        let target_folder_id = if folder_changing { requested_folder } else { cur.folder_id };
+
+        if folder_changing {
+            if let Some(target) = target_folder_id {
+                let target_row: Option<IdOwnerRow> = state
+                    .db
+                    .query_map_optional(
+                        "SELECT owner_token_id FROM folders WHERE id = $1 AND deleted_at IS NULL",
+                        params!(target),
+                    )
+                    .await
+                    .map_err(gerr)?;
+                match target_row {
+                    None => return Err(async_graphql::Error::new("target folder not found")),
+                    Some(_) => {}
+                }
+                if !acl::check_access(&state.db, tok, "folder", target, acl::Action::Write).await {
+                    return Err(async_graphql::Error::new("target folder not found"));
+                }
+            }
+        }
+
+        let new_name = name.clone().unwrap_or_else(|| cur.name.clone());
+
+        if name.is_some() || folder_changing {
+            let collision: Option<IdRow> = match target_folder_id {
+                Some(tfid) => {
+                    state
+                        .db
+                        .query_map_optional(
+                            "SELECT id FROM files WHERE name = $1 AND folder_id = $2 AND owner_token_id = $3 \
+                             AND deleted_at IS NULL AND id != $4",
+                            params!(&new_name, tfid, cur.owner_token_id, fid),
+                        )
+                        .await
+                }
+                None => {
+                    state
+                        .db
+                        .query_map_optional(
+                            "SELECT id FROM files WHERE name = $1 AND folder_id IS NULL AND owner_token_id = $2 \
+                             AND deleted_at IS NULL AND id != $3",
+                            params!(&new_name, cur.owner_token_id, fid),
+                        )
+                        .await
+                }
+            }
+            .map_err(gerr)?;
+            if collision.is_some() {
+                return Err(async_graphql::Error::new("a file with that name already exists in the target folder"));
+            }
+        }
+
+        state
+            .db
+            .execute(
+                "UPDATE files SET name = $1, folder_id = $2 WHERE id = $3",
+                params!(&new_name, target_folder_id, fid),
+            )
+            .await
+            .map_err(gerr)?;
+
+        crate::audit::log(&state.db, tok.id, "file.rename_or_move", Some("file"), Some(fid), Some(&new_name)).await;
+
+        let row: FileRow = state
+            .db
+            .query_map_optional(
+                "SELECT f.id AS id, f.name AS name, f.folder_id AS folder_id, \
+                 COALESCE(v.size, 0) AS size, f.created_at AS created_at, \
+                 v.version_no AS current_version_no, f.owner_token_id AS owner_token_id \
+                 FROM files f LEFT JOIN file_versions v ON v.id = f.current_version_id \
+                 WHERE f.id = $1",
+                params!(fid),
+            )
+            .await
+            .map_err(gerr)?
+            .ok_or(async_graphql::Error::new("file not found"))?;
+        Ok(row.into())
+    }
+
     /// Mirrors POST /admin/storage-backends (storage_backends.rs::create_backend). `config`
     /// is a JSON-encoded string (parsed and validated server-side against `kind`) — GraphQL
     /// has no native free-form JSON scalar in this schema, so this follows the same
     /// String-carrying-JSON convention already used for `mentions`/`manifest` columns.
-    async fn create_storage_backend(&self, gctx: &Context<'_>, name: String, kind: String, config: String) -> GqlResult<StorageBackend> {
+    async fn create_storage_backend(
+        &self,
+        gctx: &Context<'_>,
+        name: String,
+        kind: String,
+        config: String,
+        #[graphql(default_with = "\"primary\".to_string()")] role: String,
+    ) -> GqlResult<StorageBackend> {
         let tok = ctx_of(gctx)?;
         require_admin_gql(tok)?;
         let state = gctx.data::<AppState>()?;
         let config_val: serde_json::Value = serde_json::from_str(&config).map_err(|_| async_graphql::Error::new("config must be valid JSON"))?;
         gql_validate_backend_config(&kind, &config_val)?;
+        gql_validate_role(&role)?;
         let config_str = serde_json::to_string(&config_val).map_err(gerr)?;
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let id_row: IdRow = state
             .db
             .execute_returning_map_one(
-                "INSERT INTO storage_backends (name, kind, config, is_active, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
-                params!(&name, &kind, &config_str, &created_at),
+                "INSERT INTO storage_backends (name, kind, config, role, is_active, created_at) VALUES ($1, $2, $3, $4, 0, $5) RETURNING id",
+                params!(&name, &kind, &config_str, &role, &created_at),
             )
             .await
             .map_err(|_| async_graphql::Error::new("backend name already exists or db error"))?;
@@ -2087,6 +2389,7 @@ impl Mutation {
             name,
             config: gql_redact_config(&kind, &config_str),
             kind,
+            role,
             is_active: false,
             created_at,
         })
@@ -2101,7 +2404,7 @@ impl Mutation {
         let bid = parse_id(&id)?;
         let row: Option<StorageBackendRow> = state
             .db
-            .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(bid))
+            .query_map_optional(format!("{GQL_SELECT_BACKEND} WHERE id = $1"), params!(bid))
             .await
             .map_err(gerr)?;
         let row = row.ok_or(async_graphql::Error::new("backend not found"))?;
@@ -2114,8 +2417,8 @@ impl Mutation {
     }
 
     /// Mirrors POST /admin/storage-backends/{id}/activate (storage_backends.rs::activate_backend):
-    /// swaps `ChunkStore`'s live hot backend immediately (new writes only — see
-    /// `ChunkStore::activate_backend`'s doc comment for the deliberate non-migration limitation).
+    /// `primary`-role backends keep the classic single-active-hot-backend swap (unchanged); for
+    /// `replica`/`shard` this is additive — just flips `is_active` without touching others.
     async fn activate_storage_backend(&self, gctx: &Context<'_>, id: ID) -> GqlResult<StorageBackend> {
         let tok = ctx_of(gctx)?;
         require_admin_gql(tok)?;
@@ -2123,19 +2426,21 @@ impl Mutation {
         let bid = parse_id(&id)?;
         let row: Option<StorageBackendRow> = state
             .db
-            .query_map_optional("SELECT id, name, kind, config, is_active, created_at FROM storage_backends WHERE id = $1", params!(bid))
+            .query_map_optional(format!("{GQL_SELECT_BACKEND} WHERE id = $1"), params!(bid))
             .await
             .map_err(gerr)?;
         let row = row.ok_or(async_graphql::Error::new("backend not found"))?;
 
-        let config: serde_json::Value = serde_json::from_str(&row.config).map_err(gerr)?;
-        state
-            .storage
-            .activate_backend(&row.kind, &config)
-            .await
-            .map_err(|_| async_graphql::Error::new("failed to build/activate backend (bad config?)"))?;
+        if row.role == "primary" {
+            let config: serde_json::Value = serde_json::from_str(&row.config).map_err(gerr)?;
+            state
+                .storage
+                .activate_backend(&row.kind, &config)
+                .await
+                .map_err(|_| async_graphql::Error::new("failed to build/activate backend (bad config?)"))?;
 
-        state.db.execute("UPDATE storage_backends SET is_active = 0", params!()).await.map_err(gerr)?;
+            state.db.execute("UPDATE storage_backends SET is_active = 0 WHERE role = 'primary'", params!()).await.map_err(gerr)?;
+        }
         state.db.execute("UPDATE storage_backends SET is_active = 1 WHERE id = $1", params!(bid)).await.map_err(gerr)?;
 
         crate::audit::log(&state.db, tok.id, "storage_backend.activate", Some("storage_backend"), Some(bid), None).await;
@@ -2145,7 +2450,35 @@ impl Mutation {
             name: row.name,
             config: gql_redact_config(&row.kind, &row.config),
             kind: row.kind,
+            role: row.role,
             is_active: true,
+            created_at: row.created_at,
+        })
+    }
+
+    /// Mirrors POST /admin/storage-backends/{id}/deactivate (storage_backends.rs::deactivate_backend).
+    async fn deactivate_storage_backend(&self, gctx: &Context<'_>, id: ID) -> GqlResult<StorageBackend> {
+        let tok = ctx_of(gctx)?;
+        require_admin_gql(tok)?;
+        let state = gctx.data::<AppState>()?;
+        let bid = parse_id(&id)?;
+        let row: Option<StorageBackendRow> = state
+            .db
+            .query_map_optional(format!("{GQL_SELECT_BACKEND} WHERE id = $1"), params!(bid))
+            .await
+            .map_err(gerr)?;
+        let row = row.ok_or(async_graphql::Error::new("backend not found"))?;
+
+        state.db.execute("UPDATE storage_backends SET is_active = 0 WHERE id = $1", params!(bid)).await.map_err(gerr)?;
+        crate::audit::log(&state.db, tok.id, "storage_backend.deactivate", Some("storage_backend"), Some(bid), None).await;
+
+        Ok(StorageBackend {
+            id: ID(row.id.to_string()),
+            name: row.name,
+            config: gql_redact_config(&row.kind, &row.config),
+            kind: row.kind,
+            role: row.role,
+            is_active: false,
             created_at: row.created_at,
         })
     }
@@ -2260,6 +2593,70 @@ mod tests {
         assert!(resp.errors.is_empty(), "query errors: {:?}", resp.errors);
         let json = serde_json::to_value(&resp.data).unwrap();
         assert_eq!(json["folder"]["name"], "docs");
+    }
+
+    #[tokio::test]
+    async fn update_folder_and_update_file_mutations_work() {
+        let state = test_state().await;
+        let ctx = token_ctx(&state, "tok-a").await;
+        let schema = Schema::build(Query, Mutation, EmptySubscription).finish();
+
+        // Create two folders and rename one.
+        let mutation = r#"mutation { createFolder(name: "docs") { id } }"#;
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "createFolder errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        let docs_id = json["createFolder"]["id"].as_str().unwrap().to_string();
+
+        let mutation = r#"mutation { createFolder(name: "archive") { id } }"#;
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "createFolder errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        let archive_id = json["createFolder"]["id"].as_str().unwrap().to_string();
+
+        let mutation = format!(r#"mutation {{ updateFolder(id: "{docs_id}", name: "renamed-docs") {{ id name }} }}"#);
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "updateFolder errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        assert_eq!(json["updateFolder"]["name"], "renamed-docs");
+
+        // Cycle rejection: move "archive" (about to become parent of docs) into docs itself
+        // once docs is a child of archive would be a cycle -- simpler: try moving archive
+        // under docs, then docs under archive, expecting the second to fail.
+        let mutation = format!(r#"mutation {{ updateFolder(id: "{docs_id}", parentId: "{archive_id}") {{ id }} }}"#);
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "updateFolder move errors: {:?}", resp.errors);
+
+        let mutation = format!(r#"mutation {{ updateFolder(id: "{archive_id}", parentId: "{docs_id}") {{ id }} }}"#);
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(!resp.errors.is_empty(), "moving archive into its own descendant docs should fail");
+
+        // updateFile: create a file, rename it, move it into archive.
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let file_row: IdRow = state
+            .db
+            .execute_returning_map_one(
+                "INSERT INTO files (name, owner_token_id, created_at) VALUES ($1, $2, $3) RETURNING id",
+                params!("report.txt", ctx.id, created_at),
+            )
+            .await
+            .unwrap();
+
+        let mutation = format!(
+            r#"mutation {{ updateFile(id: "{}", name: "renamed.txt", folderId: "{archive_id}") {{ id name folderId }} }}"#,
+            file_row.id
+        );
+        let req = Request::new(mutation).data(ctx.clone()).data(state.clone());
+        let resp = schema.execute(req).await;
+        assert!(resp.errors.is_empty(), "updateFile errors: {:?}", resp.errors);
+        let json = serde_json::to_value(&resp.data).unwrap();
+        assert_eq!(json["updateFile"]["name"], "renamed.txt");
+        assert_eq!(json["updateFile"]["folderId"], archive_id);
     }
 
     #[tokio::test]

@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage ----
-# Cargo.toml pins edition = "2024"; rust:1 tracks current stable which supports it.
-FROM rust:1 AS builder
+# Cargo.toml pins edition = "2024"; rust:1-bookworm tracks current stable while pinning
+# the same Debian release as the runtime stage below. Plain `rust:1` floats onto whatever
+# Debian release is current (e.g. trixie's glibc 2.38+), which is newer than
+# debian:bookworm-slim's glibc — the resulting binary then fails to even start at runtime
+# ("version `GLIBC_2.38' not found"), before any of our own code (or its logging) runs.
+FROM rust:1-bookworm AS builder
 WORKDIR /app
 
 # Dummy build first: caches the dependency-compile layer (the slow part — hiqlite,

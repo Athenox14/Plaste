@@ -4,9 +4,23 @@
 # Cargo.toml pins edition = "2024"; rust:1 tracks current stable which supports it.
 FROM rust:1 AS builder
 WORKDIR /app
+
+# Dummy build first: caches the dependency-compile layer (the slow part — hiqlite,
+# tantivy, opendal, rustls) so it's skipped entirely unless Cargo.toml/Cargo.lock change,
+# not on every source edit. Combined with BuildKit cache mounts below so the cargo
+# registry + incremental target artifacts also survive across CI runs, not just within
+# one image build. Cache mounts aren't part of the final layer, so the binary is copied
+# out to a plain path before each cached RUN ends.
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && rm -rf src
+
 COPY src ./src
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release && cp target/release/plaste /app/plaste
 
 # ---- runtime stage ----
 # debian:bookworm-slim (not distroless): hiqlite (sqlite) and reqwest/rustls need a
@@ -14,7 +28,7 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/plaste /usr/local/bin/plaste
+COPY --from=builder /app/plaste /usr/local/bin/plaste
 
 EXPOSE 8080
 

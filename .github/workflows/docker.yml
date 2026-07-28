@@ -43,6 +43,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
           # GHA-backed layer cache: the Dockerfile's BuildKit cache mounts (cargo
           # registry + target dir) only help across builds if the underlying layer
           # cache itself persists between CI runs — this is what makes that happen.

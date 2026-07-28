@@ -180,7 +180,13 @@ async fn main() {
     breadcrumb!("router built");
 
     let port = std::env::var("PLASTE_PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("0.0.0.0:{port}");
+    // [::] plutôt que 0.0.0.0 : le réseau pod du cluster cible est IPv6-only
+    // (Cilium fd42::/...), le Service ne route que vers l'IP par défaut du pod
+    // (eth0, IPv6) — un bind IPv4-only n'a aucune interface à écouter dessus
+    // sur ce type de cluster et rend le pod injoignable malgré un "listening"
+    // en logs. Un socket IPv6 dual-stack Linux accepte aussi les connexions
+    // IPv4-mappées, donc ça reste compatible avec un déploiement IPv4 classique.
+    let addr = format!("[::]:{port}");
 
     let tls_paths = std::env::var("PLASTE_TLS_CERT").ok().zip(std::env::var("PLASTE_TLS_KEY").ok());
     breadcrumb!("tls_paths resolved: {}", tls_paths.is_some());

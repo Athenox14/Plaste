@@ -156,7 +156,7 @@ async fn main() {
         );
 
     let port = std::env::var("PLASTE_PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("0.0.0.0:{port}");
 
     let tls_paths = std::env::var("PLASTE_TLS_CERT").ok().zip(std::env::var("PLASTE_TLS_KEY").ok());
     match tls_paths {

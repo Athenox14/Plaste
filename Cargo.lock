@@ -3317,6 +3317,7 @@ name = "plaste"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "async-graphql",
  "async-graphql-axum",
  "axum",

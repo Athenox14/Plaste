@@ -26,6 +26,45 @@ out=DOC.md
     echo "- \`$path\`"
   done
   echo
+  # The path list above can't express methods, bodies or status codes, and the public
+  # sharing routes are a contract other clients code against — so their details are
+  # spelled out here rather than hand-edited into the generated DOC.md.
+  cat <<'SHARING_DOC'
+## File sharing API
+
+Owner routes (require `Authorization: Bearer <token>`; caller must own the resource, or be admin):
+
+| Method | Path | Body / query | Response |
+| --- | --- | --- | --- |
+| POST | `/shares` | `{resource_type: "file"\|"folder", resource_id: int, permission: "read"\|"write"\|"comment", password?: string, expires_at?: rfc3339}` | `{id, share_token, permission, expires_at}` |
+| GET | `/shares` | — | `[{id, share_token, resource_type, resource_id, permission, expires_at, created_at, password_protected, view_count, download_count, last_access_at}]` |
+| DELETE | `/shares/{id}` | — | `204`, link stops working immediately |
+
+The public link is `/public/shares/{share_token}`. `share_token` is 128 bits of CSPRNG
+randomness, base64url, 22 chars. `expires_at` must parse as rfc3339 or the request is `400`.
+
+Public routes (NO authentication — anyone holding the link):
+
+| Method | Path | Query | Response |
+| --- | --- | --- | --- |
+| GET | `/public/shares/{share_token}` | `password?` | file: `{kind: "file", name, size, content_type}` · folder: `{kind: "folder", name, children: [name]}` |
+| GET | `/public/shares/{share_token}/download` | `password?` | streamed file bytes (files only) |
+
+Public status codes: `404` unknown or revoked token · `410` expired · `401` password missing
+or wrong · `429` too many password attempts (5, then 1 per 12s, per share token) ·
+`400` download requested on a folder share.
+
+Notes for clients:
+- Expiry, revocation and password are re-checked on **every** request; a successful password
+  check issues no cookie or session, so revoking a share takes effect at once.
+- Downloads always come back as `Content-Type: application/octet-stream` with
+  `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`, regardless of the
+  file's real type — user-uploaded HTML must not execute on this origin. Use `content_type`
+  from the metadata route for display purposes only.
+- Statistics are aggregate only (counts plus last access time). No per-visitor data — no IP,
+  user agent or visit history — is recorded.
+
+SHARING_DOC
   echo "## Desktop client"
   echo
   for d in client; do

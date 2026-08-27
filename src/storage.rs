@@ -402,35 +402,39 @@ impl ChunkStore {
         row.map(|r| r.tier).unwrap_or_else(|| "hot".to_string())
     }
 
+    /// Reads and decrypts a single chunk to plaintext. Split out of `read_manifest` so callers
+    /// serving large files can walk a manifest chunk-by-chunk and stream each piece out as it
+    /// arrives, instead of materializing the whole file in memory (see `sharing.rs`).
+    pub async fn read_chunk(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        let buf = self.read_chunk_encrypted(hash).await?;
+        if buf.len() < KEY_ID_LEN + NONCE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk {hash} too short to contain a key id + nonce"),
+            ));
+        }
+        let (key_id_bytes, rest) = buf.split_at(KEY_ID_LEN);
+        let key_id_arr: [u8; KEY_ID_LEN] = key_id_bytes.try_into().unwrap();
+        let key_id = unpad_id(&key_id_arr);
+        let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
+        let nonce = Nonce::try_from(nonce_bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad nonce length"))?;
+        let keyring = self.keyring.lock().unwrap();
+        let cipher = keyring.get(&key_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("chunk {hash} encrypted with unknown key id {key_id:?} (key rotated out / lost)"),
+            )
+        })?;
+        cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("chunk {hash} decryption failed: {e}")))
+    }
+
     pub async fn read_manifest(&self, manifest: &[String]) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         for hash in manifest {
-            let buf = self.read_chunk_encrypted(hash).await?;
-            if buf.len() < KEY_ID_LEN + NONCE_LEN {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("chunk {hash} too short to contain a key id + nonce"),
-                ));
-            }
-            let (key_id_bytes, rest) = buf.split_at(KEY_ID_LEN);
-            let key_id_arr: [u8; KEY_ID_LEN] = key_id_bytes.try_into().unwrap();
-            let key_id = unpad_id(&key_id_arr);
-            let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
-            let nonce = Nonce::try_from(nonce_bytes)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad nonce length"))?;
-            let plaintext = {
-                let keyring = self.keyring.lock().unwrap();
-                let cipher = keyring.get(&key_id).ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("chunk {hash} encrypted with unknown key id {key_id:?} (key rotated out / lost)"),
-                    )
-                })?;
-                cipher
-                    .decrypt(&nonce, ciphertext)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("chunk {hash} decryption failed: {e}")))?
-            };
-            out.extend_from_slice(&plaintext);
+            out.extend_from_slice(&self.read_chunk(hash).await?);
         }
         Ok(out)
     }

@@ -97,6 +97,13 @@ const SCHEMA: &[&str] = &[
 const ALTERS: &[&str] = &[
     "ALTER TABLE permissions ADD COLUMN grantee_group_id INTEGER",
     "ALTER TABLE tokens ADD COLUMN expires_at TEXT",
+    // Public-share counters (sharing.rs). Deliberately aggregate columns on `shares` rather
+    // than a per-visit log: the owner only ever needs "how much was this link used", and a
+    // visit table would mean retaining IP/user-agent rows about people who specifically have
+    // no account here. Nothing identifying a visitor is stored, so there is nothing to leak.
+    "ALTER TABLE shares ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE shares ADD COLUMN download_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE shares ADD COLUMN last_access_at TEXT",
 ];
 
 /// Starts a single-node embedded hiqlite instance (no clustering) rooted at `path`,

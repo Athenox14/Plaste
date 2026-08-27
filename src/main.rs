@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, groups, keymgmt, mcp,
-    ratelimit, retention, search, sharing, state::AppState, storage, storage_backends, tags, tiering, trash, tus};
+    ratelimit, retention, search, share_page, sharing, state::AppState, storage, storage_backends, tags, tiering, trash, tus};
 
 // TEMPORARY: startup breadcrumbs for diagnosing a silent-exit-0 bug that only reproduces
 // inside the container. Bypasses the tracing subscriber entirely (raw eprintln! + explicit
@@ -160,6 +160,7 @@ async fn main() {
         .merge(mcp::router())
         .merge(retention::router())
         .merge(search::router())
+        .merge(share_page::router())
         .merge(sharing::router())
         .merge(storage_backends::router())
         .merge(tags::router())

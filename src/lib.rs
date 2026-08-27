@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod ratelimit;
 pub mod retention;
 pub mod search;
+pub mod share_page;
 pub mod sharing;
 pub mod state;
 pub mod storage;

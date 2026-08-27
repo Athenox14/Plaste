@@ -11,7 +11,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     Json, Router,
 };
@@ -36,7 +36,7 @@ pub fn router() -> Router<AppState> {
         .route("/permissions/{id}", axum::routing::delete(revoke_permission))
 }
 
-type ApiErr = (StatusCode, &'static str);
+pub(crate) type ApiErr = (StatusCode, &'static str);
 
 // ---------- link tokens, passwords, brute-force budget ----------
 
@@ -100,6 +100,111 @@ fn verify_password(stored_phc: &str, candidate: Option<&str>) -> bool {
         .is_ok()
 }
 
+/// Name of the header a public caller supplies a share password in.
+///
+/// Security: the password is NEVER accepted from the query string. A URL is written to the
+/// reverse proxy access log, the browser history and address bar, and leaks in `Referer` on any
+/// outbound navigation -- i.e. it would be persisted in exactly the places a secret must not
+/// be. A request header appears in none of those. There is deliberately no `?password=`
+/// fallback: leaving the dangerous path in "for compatibility" would keep the vulnerability.
+pub const PASSWORD_HEADER: &str = "x-share-password";
+
+fn header_password(headers: &HeaderMap) -> Option<&str> {
+    headers.get(PASSWORD_HEADER)?.to_str().ok()
+}
+
+/// How long a download ticket stays valid. Long enough to click the button on the share page,
+/// far too short to be worth anything to someone reading a log file later.
+const TICKET_TTL_SECS: u64 = 120;
+
+/// Domain-separation context for the ticket signing subkey (see `KeyRing::derive_subkey`).
+const TICKET_KEY_CONTEXT: &str = "plaste share download ticket v1";
+
+/// The key download tickets are signed with, derived from the existing master key
+/// (`PLASTE_DATA_DIR/master_keys.json`) -- no new secret, no new config, and stable across
+/// restarts because that key is persisted. It is not the master key itself: BLAKE3's KDF
+/// yields a subkey that cannot decrypt anything.
+///
+/// A master-key rotation changes the subkey and so invalidates outstanding tickets; worst case
+/// is a share page loaded less than TICKET_TTL_SECS before the rotation whose download button
+/// returns 401 and has to be re-submitted.
+fn ticket_key(state: &AppState) -> [u8; 32] {
+    state.storage.derive_subkey(TICKET_KEY_CONTEXT)
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn ticket_signature(key: &[u8; 32], share_token: &str, expires_at: u64) -> blake3::Hash {
+    // `share_token` is fixed-length base64url and never contains '.', so "token.exp" is an
+    // unambiguous encoding of the two fields.
+    blake3::keyed_hash(key, format!("{share_token}.{expires_at}").as_bytes())
+}
+
+/// Mints a short-lived, stateless proof that this share's password was verified just now.
+///
+/// Why a ticket at all: the download link is a plain `GET` the browser performs, so no header
+/// can be attached to it, and putting the password back in the URL is the very bug being fixed.
+/// A ticket in a URL is acceptable where a password is not: it expires after
+/// `TICKET_TTL_SECS`, is bound to one share token, and reveals nothing about the password.
+fn mint_download_ticket(key: &[u8; 32], share_token: &str) -> String {
+    let expires_at = now_epoch_secs() + TICKET_TTL_SECS;
+    let sig = ticket_signature(key, share_token, expires_at);
+    let payload = format!(
+        "{expires_at}.{}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            sig.as_bytes()
+        )
+    );
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+}
+
+/// Verifies a ticket: right share, right signature, not expired.
+///
+/// Security: the signature comparison goes through `blake3::Hash`'s constant-time `PartialEq`,
+/// like `tokens_match`. The expiry is part of the signed message, so extending it forges the
+/// signature. Binding the share token means a ticket minted for share A is useless on share B.
+/// A ticket proves only "the password was right less than TICKET_TTL_SECS ago" -- the caller
+/// still re-loads and re-validates the share row, so revocation is unaffected by it.
+fn verify_download_ticket(key: &[u8; 32], share_token: &str, ticket: &str) -> bool {
+    let Ok(raw) = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, ticket)
+    else {
+        return false;
+    };
+    let Ok(raw) = String::from_utf8(raw) else {
+        return false;
+    };
+    let Some((exp, sig_b64)) = raw.split_once('.') else {
+        return false;
+    };
+    let Ok(expires_at) = exp.parse::<u64>() else {
+        return false;
+    };
+    if now_epoch_secs() > expires_at {
+        return false;
+    }
+    let Ok(sig) = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sig_b64)
+    else {
+        return false;
+    };
+    let Ok(sig): Result<[u8; 32], _> = sig.try_into() else {
+        return false;
+    };
+    ticket_signature(key, share_token, expires_at) == blake3::Hash::from(sig)
+}
+
+/// Mints a download ticket for `share_token` under this server's signing key. Called by
+/// share_page.rs once a submitted password has been accepted, so the download link it renders
+/// carries a ticket instead of the password.
+pub(crate) fn download_ticket(state: &AppState, share_token: &str) -> String {
+    mint_download_ticket(&ticket_key(state), share_token)
+}
+
 /// Constant-time equality for the link token itself.
 ///
 /// Security: `blake3::Hash`'s `PartialEq` is documented as constant-time, so hashing both sides
@@ -136,10 +241,12 @@ static PASSWORD_ATTEMPTS: LazyLock<
 
 // ---------- shared row types ----------
 
-struct ShareRow {
+// Fields are pub(crate): share_page.rs (human-readable landing page) reads a resolved share's
+// resource_type/resource_id without duplicating the validation in load_valid_share below.
+pub(crate) struct ShareRow {
     id: i64,
-    resource_type: String,
-    resource_id: i64,
+    pub(crate) resource_type: String,
+    pub(crate) resource_id: i64,
     owner_token_id: i64,
     share_token: String,
     password_hash: Option<String>,
@@ -390,9 +497,11 @@ async fn revoke_share(
 
 // ---------- public share resolution ----------
 
+/// The download route's only query parameter: a short-lived ticket (see
+/// `mint_download_ticket`). There is deliberately no `password` field.
 #[derive(Deserialize)]
-struct PublicShareQuery {
-    password: Option<String>,
+struct DownloadQuery {
+    t: Option<String>,
 }
 
 /// Returns true if `expires_at` (rfc3339, if present) is in the past. An unparseable stored
@@ -414,11 +523,23 @@ fn share_expired(expires_at: &Option<String>) -> bool {
 /// on the very next request; expiry is recomputed against the current clock; the password is
 /// re-verified each time. There is no session or cookie handed out after a successful password
 /// check, precisely so that revoking or expiring a share can't be outlived by a ticket issued
-/// earlier.
-async fn load_valid_share(
+/// earlier. A download ticket is the single exception, and it stands in for the *password
+/// check* only -- the row is still re-read and re-validated below, so no ticket can outlive a
+/// revocation or an expiry.
+pub(crate) async fn load_valid_share(
     state: &AppState,
     share_token: &str,
     password: Option<&str>,
+) -> Result<ShareRow, ApiErr> {
+    load_valid_share_inner(state, share_token, password, None).await
+}
+
+/// As `load_valid_share`, but a valid download ticket may satisfy the password gate.
+async fn load_valid_share_inner(
+    state: &AppState,
+    share_token: &str,
+    password: Option<&str>,
+    ticket: Option<&str>,
 ) -> Result<ShareRow, ApiErr> {
     let share: Option<ShareRow> = state
         .db
@@ -441,6 +562,14 @@ async fn load_valid_share(
     }
 
     if let Some(hash) = &share.password_hash {
+        // A valid ticket short-circuits the password check and nothing else: revocation (the
+        // row is gone) and expiry were already re-evaluated above, on this very request.
+        if let Some(ticket) = ticket {
+            if verify_download_ticket(&ticket_key(state), share_token, ticket) {
+                return Ok(share);
+            }
+            return Err((StatusCode::UNAUTHORIZED, "invalid or expired download ticket"));
+        }
         // Throttle BEFORE hashing: Argon2's memory hardness cuts both ways, and ~19 MiB per
         // attempt makes an unthrottled verify endpoint a memory-exhaustion lever as well as a
         // brute-force one.
@@ -504,9 +633,9 @@ struct PublicFolderInfo {
 async fn resolve_public_share(
     State(state): State<AppState>,
     Path(share_token): Path<String>,
-    Query(q): Query<PublicShareQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiErr> {
-    let share = load_valid_share(&state, &share_token, q.password.as_deref()).await?;
+    let share = load_valid_share(&state, &share_token, header_password(&headers)).await?;
 
     if share.resource_type == "file" {
         struct FileInfoRow {
@@ -593,9 +722,12 @@ async fn resolve_public_share(
 async fn download_public_share(
     State(state): State<AppState>,
     Path(share_token): Path<String>,
-    Query(q): Query<PublicShareQuery>,
+    headers: HeaderMap,
+    Query(q): Query<DownloadQuery>,
 ) -> Result<impl IntoResponse, ApiErr> {
-    let share = load_valid_share(&state, &share_token, q.password.as_deref()).await?;
+    let share =
+        load_valid_share_inner(&state, &share_token, header_password(&headers), q.t.as_deref())
+            .await?;
     if share.resource_type != "file" {
         return Err((StatusCode::BAD_REQUEST, "share does not point to a file"));
     }
@@ -994,6 +1126,107 @@ mod tests {
         assert_eq!(sanitize_filename("\r\n"), "download", "must stay a valid header");
     }
 
+    /// Builds a ticket with an arbitrary expiry, the way `mint_download_ticket` does — used to
+    /// forge the cases a well-behaved server would never produce.
+    fn ticket_with_expiry(key: &[u8; 32], share_token: &str, expires_at: u64) -> String {
+        let sig = ticket_signature(key, share_token, expires_at);
+        let payload = format!(
+            "{expires_at}.{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                sig.as_bytes()
+            )
+        );
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+    }
+
+    #[test]
+    fn a_freshly_minted_ticket_verifies_and_carries_no_password() {
+        let key = [7u8; 32];
+        let token = generate_share_token();
+        let ticket = mint_download_ticket(&key, &token);
+        assert!(verify_download_ticket(&key, &token, &ticket));
+
+        // base64url only, so it is safe to drop straight into a URL, and it cannot contain the
+        // password it stands in for.
+        assert!(ticket.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(!ticket.contains("password"));
+    }
+
+    #[test]
+    fn an_expired_ticket_is_refused() {
+        let key = [7u8; 32];
+        let token = generate_share_token();
+        // One second past its expiry is already too late; the TTL is only a couple of minutes.
+        let stale = ticket_with_expiry(&key, &token, now_epoch_secs() - 1);
+        assert!(!verify_download_ticket(&key, &token, &stale));
+        assert!(verify_download_ticket(
+            &key,
+            &token,
+            &ticket_with_expiry(&key, &token, now_epoch_secs() + 5)
+        ));
+        assert_eq!(TICKET_TTL_SECS, 120, "tickets must stay short-lived");
+    }
+
+    #[test]
+    fn a_forged_ticket_is_refused() {
+        let key = [7u8; 32];
+        let token = generate_share_token();
+        let expires_at = now_epoch_secs() + TICKET_TTL_SECS;
+
+        // Signed with a different key (an attacker who does not have the server secret).
+        assert!(!verify_download_ticket(
+            &key,
+            &token,
+            &ticket_with_expiry(&[8u8; 32], &token, expires_at)
+        ));
+
+        // Expiry pushed out while keeping a signature that covered the original one: the expiry
+        // is part of the signed message, so this cannot verify.
+        let ticket = mint_download_ticket(&key, &token);
+        let raw = String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &ticket)
+                .unwrap(),
+        )
+        .unwrap();
+        let sig_b64 = raw.split_once('.').unwrap().1;
+        let extended = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            format!("{}.{sig_b64}", now_epoch_secs() + 86_400),
+        );
+        assert!(!verify_download_ticket(&key, &token, &extended));
+
+        // Structural junk fails closed rather than panicking.
+        for junk in ["", "!!!!", "Zm9v", "Zm9vLmJhcg"] {
+            assert!(!verify_download_ticket(&key, &token, junk), "junk accepted: {junk}");
+        }
+    }
+
+    /// The download route has no `password` query parameter any more: a URL carrying one is
+    /// parsed as if it were absent, so nothing can resurrect the leaky path by accident.
+    #[test]
+    fn the_download_route_has_no_password_query_parameter() {
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("http://x/d?{qs}").parse().unwrap();
+            Query::<DownloadQuery>::try_from_uri(&uri).unwrap().0
+        };
+        assert!(parse("password=s3cret").t.is_none());
+        assert_eq!(parse("t=abc&password=s3cret").t.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_ticket_for_another_share_is_refused() {
+        let key = [7u8; 32];
+        let mine = generate_share_token();
+        let theirs = generate_share_token();
+        let ticket = mint_download_ticket(&key, &mine);
+        assert!(verify_download_ticket(&key, &mine, &ticket));
+        assert!(
+            !verify_download_ticket(&key, &theirs, &ticket),
+            "a ticket must not be replayable against a different share"
+        );
+    }
+
     // ---------- end-to-end over the router ----------
 
     async fn setup() -> (AppState, tempfile::TempDir) {
@@ -1081,9 +1314,23 @@ mod tests {
         state: &AppState,
         uri: &str,
     ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        public_get_pw(state, uri, None).await
+    }
+
+    /// `password` goes in the `X-Share-Password` header — the only way the public routes accept
+    /// it. There is no query-string form to exercise.
+    async fn public_get_pw(
+        state: &AppState,
+        uri: &str,
+        password: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut req = Request::builder().uri(uri);
+        if let Some(pw) = password {
+            req = req.header(PASSWORD_HEADER, pw);
+        }
         let resp = router()
             .with_state(state.clone())
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -1212,30 +1459,86 @@ mod tests {
 
         let (status, _, _) = public_get(&state, &format!("/public/shares/{pt}")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "no password supplied");
-        let (status, _, _) = public_get(&state, &format!("/public/shares/{pt}?password=wrong")).await;
+        let (status, _, _) =
+            public_get_pw(&state, &format!("/public/shares/{pt}"), Some("wrong")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _, _) =
-            public_get(&state, &format!("/public/shares/{pt}/download?password=wrong")).await;
+            public_get_pw(&state, &format!("/public/shares/{pt}/download"), Some("wrong")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "download must be gated too");
 
         let (status, _, _) =
-            public_get(&state, &format!("/public/shares/{pt}?password=open%20sesame")).await;
+            public_get_pw(&state, &format!("/public/shares/{pt}"), Some("open sesame")).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _, body) =
-            public_get(&state, &format!("/public/shares/{pt}/download?password=open%20sesame")).await;
+            public_get_pw(&state, &format!("/public/shares/{pt}/download"), Some("open sesame"))
+                .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, content);
 
-        // --- brute force runs out of budget rather than continuing indefinitely ---
+        // --- the download ticket the share page hands out works, and only there ---
+        let ticket = download_ticket(&state, pt);
+        let (status, _, body) =
+            public_get(&state, &format!("/public/shares/{pt}/download?t={ticket}")).await;
+        assert_eq!(status, StatusCode::OK, "a fresh ticket must be accepted");
+        assert_eq!(body, content);
+
+        let (status, _, _) =
+            public_get(&state, &format!("/public/shares/{pt}/download?t=deadbeef")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a garbage ticket must be refused");
+
+        // The ticket is bound to one share: the open share's token can't reuse it, and this
+        // one's can't be swapped for another protected share's.
+        let other = create_share_via_api(
+            &state,
+            &bearer,
+            serde_json::json!({
+                "resource_type": "file",
+                "resource_id": file_id,
+                "permission": "read",
+                "password": "open sesame",
+            }),
+        )
+        .await;
+        let other_token = other["share_token"].as_str().unwrap();
+        let (status, _, _) =
+            public_get(&state, &format!("/public/shares/{other_token}/download?t={ticket}")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a ticket for another share must be refused");
+
+        // --- brute force runs out of budget rather than continuing indefinitely; a POST-style
+        // header submission is throttled exactly like the old query-string one was ---
         let mut saw_429 = false;
         for _ in 0..12 {
             let (status, _, _) =
-                public_get(&state, &format!("/public/shares/{pt}?password=nope")).await;
+                public_get_pw(&state, &format!("/public/shares/{pt}"), Some("nope")).await;
             if status == StatusCode::TOO_MANY_REQUESTS {
                 saw_429 = true;
                 break;
             }
         }
         assert!(saw_429, "password attempts must be rate limited");
+
+        // --- a ticket must not outlive revocation ---
+        let fresh = download_ticket(&state, other_token);
+        let other_id = other["id"].as_i64().unwrap();
+        let resp = router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/shares/{other_id}"))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let (status, _, _) =
+            public_get(&state, &format!("/public/shares/{other_token}/download?t={fresh}")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a ticket must never survive a revocation"
+        );
     }
 }

@@ -122,6 +122,20 @@ impl KeyRing {
         (&self.current_key_id, cipher)
     }
 
+    /// Derives a purpose-bound 32-byte subkey from the *current* master key.
+    ///
+    /// Security: BLAKE3's `derive_key` is a KDF with domain separation by `context`, so a subkey
+    /// handed to some other subsystem (e.g. signing short-lived share download tickets) can
+    /// never be used to decrypt chunks, and two contexts can't produce the same subkey. The
+    /// master key never leaves this type.
+    ///
+    /// Note this follows the current key: after `rotate`, subkeys change too. Anything derived
+    /// here must therefore be short-lived or re-derivable, never long-term stored state.
+    pub fn derive_subkey(&self, context: &str) -> [u8; 32] {
+        let master = self.raw_keys.get(&self.current_key_id).expect("current key always present");
+        blake3::derive_key(context, master)
+    }
+
     /// Looks up a cipher by key id (as read back from a chunk's wire prefix, already unpadded).
     pub fn get(&self, key_id: &str) -> Option<&Aes256Gcm> {
         self.ciphers.get(key_id)

@@ -12,6 +12,8 @@
     "notification:default",
     "autostart:default",
     "updater:default",
-    "store:default"
+    "store:default",
+    "dialog:default",
+    "clipboard-manager:allow-write-text"
   ]
 }

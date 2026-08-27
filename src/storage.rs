@@ -600,6 +600,13 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Derives a purpose-bound subkey from the master keyring's current key (see
+    /// `KeyRing::derive_subkey`). Used by `sharing.rs` to sign short-lived download tickets so
+    /// they need no extra secret and no extra dependency.
+    pub fn derive_subkey(&self, context: &str) -> [u8; 32] {
+        self.keyring.lock().unwrap().derive_subkey(context)
+    }
+
     /// Rotates the master keyring: generates a new key, makes it current for all future
     /// writes, and keeps the old key(s) around so existing chunks still decrypt. Returns the
     /// new key id.

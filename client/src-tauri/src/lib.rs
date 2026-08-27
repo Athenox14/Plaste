@@ -1,8 +1,11 @@
+mod account;
 mod api_client;
 mod known_folders;
 mod power;
+mod remote;
 mod sync_config;
 mod sync_engine;
+mod transfer;
 mod user_folders;
 mod virtualfs;
 mod watcher;
@@ -41,6 +44,10 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
+        // Sélecteur de fichiers (téléverser) / d'emplacement (télécharger) natif.
+        .plugin(tauri_plugin_dialog::init())
+        // Copier un lien de partage : l'API clipboard du webview est souvent bloquée.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             // Tray icon with a minimal show/quit menu. Left-click shows the window;
             // this is the "system-tray-accessible small window" entry point.
@@ -105,6 +112,23 @@ pub fn run() {
             known_folders::list_known_folders,
             known_folders::redirect_folder_cmd,
             known_folders::revert_folder_cmd,
+            // Configuration du serveur + jeton (trousseau système)
+            account::server_get,
+            account::server_set,
+            account::token_get,
+            account::token_set,
+            account::token_clear,
+            transfer::server_probe,
+            // Transferts en flux
+            transfer::upload_stream,
+            transfer::download_stream,
+            transfer::transfer_cancel,
+            // Parcours / partage
+            remote::remote_list,
+            remote::remote_create_folder,
+            remote::remote_update_file,
+            remote::remote_delete_file,
+            remote::share_create,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

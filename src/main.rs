@@ -152,7 +152,23 @@ async fn main() {
         .merge(audit::router())
         .merge(chunk_upload::router().layer(upload_limit.clone()))
         .merge(comments::router())
-        .merge(files::router().layer(upload_limit.clone()))
+        // Borne de corps EXPLICITE sur les envois en une seule requete.
+        //
+        // Sans elle, la valeur par defaut d'axum s'appliquait : 2 Mio. Tout
+        // fichier au-dela repondait 413, y compris quand le proxy en amont
+        // acceptait 10 Gio — le plafond reel etait ici, et invisible.
+        //
+        // Pourquoi 256 Mio et pas 10 Gio : `upload` lit le champ avec
+        // `field.bytes()`, donc le fichier tient ENTIEREMENT en memoire, et le
+        // conteneur est limite a 1 Gio. Autoriser 10 Gio ne ferait pas passer
+        // les gros fichiers, ca tuerait le processus au premier essai et
+        // couperait le stockage de tout le monde.
+        //
+        // Au-dela de cette borne, la voie est l'envoi par morceaux (tus /
+        // chunks, 8 Mio par requete), qui ne charge jamais le fichier entier.
+        .merge(files::router()
+            .layer(upload_limit.clone())
+            .layer(axum::extract::DefaultBodyLimit::max(256 * 1024 * 1024)))
         .merge(folders::router())
         .merge(graphql::router())
         .merge(groups::router())

@@ -138,6 +138,9 @@ fn split_name(name: &str) -> (&str, &str) {
 pub(crate) enum ContentSource<'a> {
     Raw(&'a [u8]),
     Manifest(Vec<String>, i64),
+    /// Fichier sur disque, decoupe en flux : rien n'est charge entier en memoire.
+    /// Voie des envois volumineux (tus), ou `Raw` ferait tomber le processus.
+    Path(&'a std::path::Path),
 }
 
 /// Upserts one manifest-reference's worth of refcount for `hash`: increments if the `chunks`
@@ -183,6 +186,20 @@ pub(crate) async fn store_new_version(
     uploader_token_id: i64,
 ) -> Result<StoreOutcome, ApiErr> {
     store_new_version_impl(state, file_id, ContentSource::Raw(data), expected_base_version, uploader_token_id).await
+}
+
+/// Comme `store_new_version`, mais en lisant le contenu DEPUIS UN FICHIER, par
+/// morceaux. Pour la finalisation d'un envoi resumable : le fichier partiel fait
+/// deja plusieurs gigaoctets sur disque, le lire entierement en memoire
+/// ferait tomber le processus.
+pub(crate) async fn store_new_version_from_path(
+    state: &AppState,
+    file_id: i64,
+    path: &std::path::Path,
+    expected_base_version: Option<i64>,
+    uploader_token_id: i64,
+) -> Result<StoreOutcome, ApiErr> {
+    store_new_version_impl(state, file_id, ContentSource::Path(path), expected_base_version, uploader_token_id).await
 }
 
 /// Same as `store_new_version` but for chunk_upload.rs's finalize: `manifest`'s chunks are
@@ -286,6 +303,11 @@ async fn write_version_row_from_source(
             .await
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage write failed"))?,
         ContentSource::Manifest(manifest, size) => (manifest, size),
+        ContentSource::Path(path) => state
+            .storage
+            .write_from_path(path)
+            .await
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage write failed"))?,
     };
 
     for hash in &manifest {

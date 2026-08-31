@@ -376,6 +376,34 @@ impl ChunkStore {
         Ok((manifest, data.len() as i64))
     }
 
+    /// Découpe et stocke le contenu d'un FICHIER sans jamais le charger entier.
+    ///
+    /// `write` prend un `&[u8]`, donc tout appelant doit d'abord tenir le
+    /// fichier complet en memoire. Pour un envoi de plusieurs gigaoctets dans un
+    /// conteneur limite a 1 Gio, ca ne reduit pas les performances : ca tue le
+    /// processus, et coupe le stockage de tous les comptes.
+    ///
+    /// `StreamCDC` produit les memes frontieres de morceaux que `FastCDC` a
+    /// parametres egaux, donc la deduplication reste identique entre les deux
+    /// chemins : un fichier envoye d'une facon ou de l'autre partage ses morceaux.
+    ///
+    /// ponytail: lecture bloquante dans un contexte async, acceptable ici (voie
+    /// de finalisation, hors chemin critique, et un morceau fait au plus 4 Mio).
+    /// A passer en `spawn_blocking` si ca devient un point chaud.
+    pub async fn write_from_path(&self, path: &std::path::Path) -> std::io::Result<(Vec<String>, i64)> {
+        let file = std::fs::File::open(path)?;
+        let mut manifest = Vec::new();
+        let mut total: i64 = 0;
+        for result in fastcdc::v2020::StreamCDC::new(file, MIN, AVG, MAX) {
+            let chunk = result.map_err(std::io::Error::other)?;
+            let hash = blake3::hash(&chunk.data).to_hex().to_string();
+            self.write_chunk_bytes(&hash, &chunk.data).await?;
+            total += chunk.length as i64;
+            manifest.push(hash);
+        }
+        Ok((manifest, total))
+    }
+
     /// Writes one already-hashed chunk (the chunk-aware upload path's `POST
     /// /chunks/upload/{hash}` — see chunk_upload.rs). Caller must have already verified
     /// `hash == blake3(bytes)` before calling this (this method trusts `hash` as given).
@@ -941,5 +969,46 @@ mod tests {
 
         let read_back = store.read_manifest(&manifest).await.unwrap();
         assert_eq!(read_back, data);
+    }
+}
+
+#[cfg(test)]
+mod tests_flux {
+    use super::*;
+    use std::io::Write;
+
+    /// Le decoupage en flux doit produire EXACTEMENT le meme manifeste que le
+    /// decoupage en memoire. Sinon un fichier envoye par la voie resumable ne
+    /// partagerait plus ses morceaux avec le meme fichier envoye en une requete :
+    /// la deduplication tomberait sans que rien n'echoue, et le stockage
+    /// doublerait en silence.
+    #[test]
+    fn flux_et_memoire_donnent_les_memes_frontieres() {
+        // Assez gros pour depasser MIN et produire plusieurs morceaux, et
+        // pseudo-aleatoire pour que les frontieres ne soient pas triviales.
+        let mut donnees = Vec::with_capacity(6 * 1024 * 1024);
+        let mut graine: u64 = 0x12345678;
+        while donnees.len() < 6 * 1024 * 1024 {
+            graine = graine.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            donnees.extend_from_slice(&graine.to_le_bytes());
+        }
+
+        let en_memoire: Vec<(usize, usize)> = FastCDC::new(&donnees, MIN, AVG, MAX)
+            .map(|c| (c.offset, c.length))
+            .collect();
+
+        let mut fichier = tempfile::NamedTempFile::new().expect("fichier temporaire");
+        fichier.write_all(&donnees).expect("ecriture");
+        let en_flux: Vec<(usize, usize)> = fastcdc::v2020::StreamCDC::new(
+            std::fs::File::open(fichier.path()).expect("ouverture"), MIN, AVG, MAX,
+        )
+        .map(|r| {
+            let c = r.expect("morceau");
+            (c.offset as usize, c.length)
+        })
+        .collect();
+
+        assert_eq!(en_memoire, en_flux, "frontieres divergentes : la deduplication serait perdue");
+        assert!(en_memoire.len() > 1, "le jeu de test doit produire plusieurs morceaux");
     }
 }

@@ -311,9 +311,9 @@ async fn finish_upload(
     folder_id: Option<i64>,
     expected_base_version: Option<i64>,
 ) -> Result<crate::files::StoreOutcome, ApiErr> {
-    let data = tokio::fs::read(partial_path(id))
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "io error"))?;
+    // On ne LIT PAS le fichier partiel en memoire : il fait la taille de l'envoi,
+    // soit plusieurs gigaoctets. Le decoupage se fait en flux depuis le disque.
+    let chemin_partiel = partial_path(id);
 
     let existing_file: Option<IdRow> = match folder_id {
         Some(fid) => {
@@ -353,7 +353,9 @@ async fn finish_upload(
         row.id
     };
 
-    let outcome = crate::files::store_new_version(state, file_id, &data, expected_base_version, ctx.id).await?;
+    let outcome = crate::files::store_new_version_from_path(
+        state, file_id, &chemin_partiel, expected_base_version, ctx.id,
+    ).await?;
     let size = match &outcome {
         crate::files::StoreOutcome::Normal { size, .. } | crate::files::StoreOutcome::Conflict { size, .. } => *size,
     };

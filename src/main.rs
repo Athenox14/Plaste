@@ -181,7 +181,13 @@ async fn main() {
         .merge(storage_backends::router())
         .merge(tags::router())
         .merge(trash::router())
-        .merge(tus::router().layer(upload_limit))
+        // Meme raison que pour files: la valeur par defaut d'axum (2 Mio)
+        // s'appliquait aux PATCH tus, ce qui bornait chaque tranche a 2 Mio sans
+        // que rien ne le dise. 8 Mio est sans risque ici : une tranche est
+        // ajoutee au fichier partiel sur disque, jamais accumulee.
+        .merge(tus::router()
+            .layer(upload_limit)
+            .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(general_limit)

@@ -1,9 +1,37 @@
 name: Fuzzing
 
-# Nocturne et non a chaque poussee : une campagne utile dure des minutes, pas des
-# secondes, et bloquerait les pull requests pour rien. Les invariants rapides
-# sont deja couverts par les tests de proprietes (proptest) dans `cargo test`.
+# DEUX MODES, parce que « a chaque build » et « exploration profonde » sont
+# incompatibles.
+#
+#  - A chaque poussee/PR : on REJOUE le corpus existant sur toutes les cibles.
+#    C'est un test de regression, deterministe et rapide : si un changement
+#    casse une entree deja connue, on l'apprend tout de suite. Suivi d'une
+#    exploration courte, juste assez pour attraper un defaut peu profond
+#    introduit par le diff.
+#
+#  - La nuit : exploration longue, qui fait grossir le corpus. C'est la seule
+#    qui trouve des cas nouveaux — la couverture plafonne vite, donc ce qui
+#    paie est d'ajouter des CIBLES, pas des heures.
+#
+# Mesure du 31/08/2026 : le job a dure ~11 minutes pour 121 s de fuzzing.
+# L'ecart vient de l'installation de nightly, de cargo-fuzz et de la
+# compilation avec sanitizers — d'ou le cache, et une exploration courte en
+# mode build pour que le rapport reste acceptable.
 on:
+  push:
+    branches: [main]
+    # Inutile de refuzzer quand seuls la documentation ou les workflows bougent.
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -13,13 +41,22 @@ on:
         required: false
         default: "600"
 
+# Une poussee qui en suit une autre annule la precedente : sans ca, plusieurs
+# campagnes se marchent dessus sur le meme corpus.
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 30 min de campagne nocturne + ~10 min de compilation avec sanitizers, plus
+    # une marge : sans elle, la campagne serait tuee juste avant la sauvegarde
+    # du corpus, et la nuit serait perdue.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -60,10 +97,32 @@ jobs:
           key: corpus-${{ matrix.cible }}-${{ github.run_id }}
           restore-keys: corpus-${{ matrix.cible }}-
 
+      # REGRESSION : rejoue le corpus sans rien explorer (-runs=0). Deterministe
+      # et quasi instantane. Si un changement fait paniquer une entree deja
+      # connue, l'echec est ici, avec l'entree fautive en main — alors qu'une
+      # campagne d'exploration pourrait ne pas retomber dessus.
+      - name: Rejeu du corpus (regression)
+        working-directory: fuzz
+        run: |
+          mkdir -p "corpus/${{ matrix.cible }}"
+          if [ -z "$(ls -A "corpus/${{ matrix.cible }}" 2>/dev/null)" ]; then
+            echo "corpus vide (premiere execution) — rien a rejouer"
+            exit 0
+          fi
+          echo "rejeu de $(ls -1 "corpus/${{ matrix.cible }}" | wc -l) entrees"
+          cargo fuzz run "${{ matrix.cible }}" "corpus/${{ matrix.cible }}" -- -runs=0
+
       - name: Campagne
         working-directory: fuzz
         run: |
-          duree="${{ github.event.inputs.duree_secondes || '600' }}"
+          # Exploration courte sur un build, longue la nuit : sur un diff on
+          # cherche un defaut peu profond, pas a etendre la couverture.
+          case "${{ github.event_name }}" in
+            schedule)          duree=1800 ;;
+            workflow_dispatch) duree="${{ github.event.inputs.duree_secondes || '600' }}" ;;
+            *)                 duree=90 ;;
+          esac
+          echo "mode ${{ github.event_name }} : ${duree}s"
           mkdir -p "corpus/${{ matrix.cible }}"
           # -runs=-1 : illimite en nombre, c'est -max_total_time qui borne.
           # -timeout=10 : une entree qui depasse 10 s est un defaut en soi.
@@ -80,8 +139,11 @@ jobs:
         working-directory: fuzz
         run: cargo fuzz cmin "${{ matrix.cible }}" || true
 
+      # PAS depuis une pull request : une branche de travail ne doit pas
+      # injecter ses entrees dans le corpus commun, qui suivrait alors du code
+      # jamais fusionne.
       - name: Conserver le corpus
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: fuzz/corpus/${{ matrix.cible }}

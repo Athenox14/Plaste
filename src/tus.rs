@@ -136,7 +136,12 @@ async fn discovery() -> impl IntoResponse {
 // ---------- POST /tus/uploads (Creation) ----------
 
 /// Decodes tus `Upload-Metadata`: comma-separated `key base64(value)` pairs.
-fn parse_metadata(raw: &str) -> std::collections::HashMap<String, String> {
+///
+/// `pub` uniquement pour que la cible de fuzzing (`fuzz/fuzz_targets/`) puisse
+/// l'atteindre : une cible libFuzzer est une caisse SEPAREE, qui ne voit que
+/// l'API publique de celle-ci. Reste un detail d'implementation de tus, a ne
+/// pas appeler ailleurs.
+pub fn parse_metadata(raw: &str) -> std::collections::HashMap<String, String> {
     use base64::Engine;
     raw.split(',')
         .map(str::trim)
@@ -707,5 +712,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[cfg(test)]
+mod proprietes_metadonnees {
+    use super::parse_metadata;
+    use base64::Engine;
+    use proptest::prelude::*;
+
+    // `Upload-Metadata` arrive d'Internet, en clair, dans un en-tete HTTP. Ces
+    // proprietes ne verifient pas un cas particulier mais un invariant sur
+    // TOUTE entree : le decodage ne doit jamais paniquer, et ne jamais rendre
+    // une valeur qui n'a pas ete effectivement decodee depuis du base64.
+    proptest! {
+        /// Aucune entree, meme absurde, ne doit faire paniquer le decodage.
+        /// Une panique ici serait un deni de service : un en-tete suffirait a
+        /// tuer le gestionnaire de requete.
+        #[test]
+        fn ne_panique_jamais(brut in ".{0,400}") {
+            let _ = parse_metadata(&brut);
+        }
+
+        /// Une paire bien formee doit etre restituee telle quelle. C'est la
+        /// contrepartie de la propriete precedente : ne pas paniquer ne sert a
+        /// rien si le decodage perd des donnees valides.
+        #[test]
+        fn restitue_une_paire_bien_formee(
+            cle in "[a-zA-Z][a-zA-Z0-9_]{0,20}",
+            valeur in ".{0,60}",
+        ) {
+            let encode = base64::engine::general_purpose::STANDARD.encode(valeur.as_bytes());
+            let sortie = parse_metadata(&format!("{cle} {encode}"));
+            prop_assert_eq!(sortie.get(&cle), Some(&valeur));
+        }
+
+        /// Une valeur non decodable doit etre ECARTEE, pas transmise brute.
+        /// Sans ca, `filename` pourrait contenir n'importe quoi et ce nom part
+        /// ensuite en base puis dans du HTML.
+        #[test]
+        fn ecarte_une_valeur_non_base64(cle in "[a-z]{1,10}") {
+            // `!` et `@` ne font pas partie de l'alphabet base64 standard.
+            let sortie = parse_metadata(&format!("{cle} !!!@@@"));
+            prop_assert!(sortie.get(&cle).is_none());
+        }
+
+        /// Le separateur de paires est la virgule : aucune cle rendue ne doit en
+        /// contenir, sinon une seule paire pourrait en simuler plusieurs.
+        #[test]
+        fn aucune_cle_ne_contient_de_virgule(brut in "[a-zA-Z0-9 ,=+/]{0,200}") {
+            for cle in parse_metadata(&brut).keys() {
+                prop_assert!(!cle.contains(','), "cle inattendue : {:?}", cle);
+            }
+        }
     }
 }

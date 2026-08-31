@@ -32,5 +32,10 @@ tracing-subscriber = "0.3.23"
 uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
+# Tests de proprietes sur les fonctions qui digerent une entree NON FIABLE
+# (en-tetes tus, noms de fichiers rendus en HTML). Tourne dans `cargo test`,
+# sur stable : contrairement au fuzzing guide, aucune chaine nightly ni corpus
+# a maintenir, donc ca s'execute a chaque poussee et non une fois par nuit.
+proptest = "1.8.0"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

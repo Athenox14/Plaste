@@ -1,0 +1,34 @@
+[package]
+name = "plaste-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Caisse de fuzzing, volontairement HORS de l'espace de travail principal :
+# les cibles libFuzzer exigent la chaine nightly, et on ne veut pas que
+# `cargo build` ou `cargo test` en stable tente de les compiler.
+[package.metadata]
+cargo-fuzz = true
+
+# Espace de travail VIDE et explicite : sans ca, cargo remonte l'arborescence et
+# rattache cette caisse au paquet parent, qui tenterait alors de la compiler en
+# stable — or libfuzzer-sys exige nightly.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.plaste]
+path = ".."
+
+[[bin]]
+name = "tus_metadata"
+path = "fuzz_targets/tus_metadata.rs"
+test = false
+doc = false
+bench = false
+
+# Les cibles de fuzzing veulent des symboles de debogage ET de l'optimisation :
+# sans optimisation le debit s'ecroule, sans symboles un plantage est illisible.
+[profile.release]
+debug = 1

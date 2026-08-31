@@ -304,3 +304,64 @@ mod tests {
         assert!(!password_form("tok-123", false).contains("incorrect"));
     }
 }
+
+#[cfg(test)]
+mod proprietes_echappement {
+    use super::escape_html;
+    use proptest::prelude::*;
+
+    // La page de partage affiche un NOM DE FICHIER choisi par l'utilisateur,
+    // dans une page servie a des visiteurs anonymes. `escape_html` est donc la
+    // seule barriere entre un nom hostile et du script execute chez le
+    // visiteur. Ces proprietes la verrouillent : elles echoueront si quelqu'un
+    // « simplifie » la fonction un jour.
+    proptest! {
+        /// Aucun caractere structurant de HTML ne survit a l'echappement.
+        /// C'est la propriete qui compte : ni balise, ni sortie d'attribut.
+        #[test]
+        fn aucun_caractere_structurant_ne_survit(entree in ".{0,200}") {
+            let sortie = escape_html(&entree);
+            for interdit in ['<', '>', '"', '\''] {
+                prop_assert!(
+                    !sortie.contains(interdit),
+                    "{:?} a survecu a l'echappement de {:?}", interdit, entree
+                );
+            }
+        }
+
+        /// Une entree sans caractere special doit ressortir INTACTE : un
+        /// echappement trop zele abimerait des noms de fichiers legitimes
+        /// (accents, espaces, parentheses).
+        #[test]
+        fn preserve_une_entree_sans_caractere_special(
+            entree in "[a-zA-Z0-9éèàùç _().-]{0,100}"
+        ) {
+            prop_assert_eq!(escape_html(&entree), entree);
+        }
+
+        /// L'echappement est stable en longueur de caracteres : il ne perd
+        /// jamais de contenu, il ne fait que remplacer.
+        #[test]
+        fn ne_perd_jamais_de_contenu(entree in ".{0,200}") {
+            prop_assert!(escape_html(&entree).chars().count() >= entree.chars().count());
+        }
+    }
+
+    /// Vecteurs concrets, en plus des proprietes : une propriete peut passer sur
+    /// des entrees aleatoires sans jamais tirer le cas qui compte vraiment.
+    #[test]
+    fn neutralise_les_vecteurs_connus() {
+        for vecteur in [
+            "<script>alert(1)</script>",
+            "\" onerror=alert(1) x=\"",
+            "' onmouseover='alert(1)",
+            "<img src=x onerror=alert(1)>",
+            "</title><script>alert(1)</script>",
+        ] {
+            let sortie = escape_html(vecteur);
+            assert!(!sortie.contains('<'), "balise ouverte dans {sortie:?}");
+            assert!(!sortie.contains('"'), "guillemet dans {sortie:?}");
+            assert!(!sortie.contains('\''), "apostrophe dans {sortie:?}");
+        }
+    }
+}

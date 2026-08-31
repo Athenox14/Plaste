@@ -14,3 +14,9 @@ client/src-tauri/gen/
 *.log
 .env
 nul
+
+# Fuzzing : artefacts locaux. Le corpus est conserve par le cache Actions, pas
+# dans le depot — il grossit vite et n'a aucun interet en revue.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

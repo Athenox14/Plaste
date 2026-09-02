@@ -10,6 +10,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/tokens", post(create_token).get(list_tokens))
         .route("/admin/tokens/{id}", delete(delete_token))
         .route("/admin/tokens/{id}/renew", put(renew_token))
+        .route("/admin/tokens/{id}/rotate", post(rotate_token))
 }
 
 fn default_duration_days() -> i64 {
@@ -154,6 +155,44 @@ async fn renew_token(
     Ok(Json(serde_json::json!({ "id": id, "expires_at": expires_at })))
 }
 
+/// Remplace le SECRET d'un jeton en gardant sa ligne — donc son `id`.
+///
+/// POURQUOI PAS « supprimer puis recreer ». Tout ce que possede un compte est
+/// rattache a `owner_token_id` : `folders`, `files`, `tus_uploads`, les
+/// permissions. Un nouveau jeton recevrait un nouvel `id` et l'utilisateur
+/// retrouverait un espace VIDE, ses fichiers devenus inaccessibles. La rotation
+/// doit donc conserver l'identite du jeton et ne changer que la chaine secrete.
+///
+/// L'ancien secret cesse de fonctionner immediatement : c'est le but quand il a
+/// fuite. Les clients qui l'utilisaient prendront un 401 et devront recuperer le
+/// nouveau.
+async fn rotate_token(
+    State(state): State<AppState>,
+    ctx: TokenCtx,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    require_admin(&ctx)?;
+    let nouveau = format!("plaste-{}", Uuid::new_v4());
+
+    // `rows_affected` a 0 = jeton inexistant. Sans cette verification on
+    // renverrait un secret tout neuf qui n'authentifie rien.
+    let touchees = state
+        .db
+        .execute(
+            "UPDATE tokens SET token = $1 WHERE id = $2",
+            params!(&nouveau, id),
+        )
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
+    if touchees == 0 {
+        return Err((StatusCode::NOT_FOUND, "token not found"));
+    }
+
+    crate::audit::log(&state.db, ctx.id, "token.rotate", Some("token"), Some(id), None).await;
+
+    Ok(Json(serde_json::json!({ "id": id, "token": nouveau })))
+}
+
 async fn delete_token(
     State(state): State<AppState>,
     ctx: TokenCtx,
@@ -201,6 +240,74 @@ mod tests {
         .await
         .unwrap();
         token
+    }
+
+    /// L'invariant qui compte : la rotation change le secret mais PAS l'`id`.
+    /// Tout ce que possede un compte pend a `owner_token_id` ; si l'id bougeait,
+    /// l'utilisateur retrouverait un espace vide.
+    #[tokio::test]
+    async fn rotate_change_le_secret_mais_pas_l_id() {
+        let (state, _dir) = setup().await;
+        let admin_token = make_admin_token(&state.db).await;
+
+        let app = router().with_state(state.clone());
+        let creation = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/tokens")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"owner":"u","duration_days":30}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let corps = axum::body::to_bytes(creation.into_body(), usize::MAX).await.unwrap();
+        let cree: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+        let id = cree["id"].as_i64().unwrap();
+        let ancien = cree["token"].as_str().unwrap().to_string();
+
+        let app = router().with_state(state.clone());
+        let rotation = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/tokens/{id}/rotate"))
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotation.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(rotation.into_body(), usize::MAX).await.unwrap();
+        let tourne: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+
+        assert_eq!(tourne["id"].as_i64().unwrap(), id, "l'id doit etre preserve");
+        let nouveau = tourne["token"].as_str().unwrap();
+        assert_ne!(nouveau, ancien, "le secret doit changer");
+
+        // L'ancien secret n'authentifie plus rien, le nouveau porte le meme id.
+        let restant: Option<crate::auth::TokenCtx> = state
+            .db
+            .query_map_optional(
+                "SELECT id, owner, is_admin, quota_bytes, used_bytes, expires_at FROM tokens WHERE token = $1",
+                params!(&ancien),
+            )
+            .await
+            .unwrap();
+        assert!(restant.is_none(), "l'ancien secret doit cesser de fonctionner");
+
+        let actuel: crate::auth::TokenCtx = state
+            .db
+            .query_map_one(
+                "SELECT id, owner, is_admin, quota_bytes, used_bytes, expires_at FROM tokens WHERE token = $1",
+                params!(nouveau),
+            )
+            .await
+            .unwrap();
+        assert_eq!(actuel.id, id);
     }
 
     #[tokio::test]

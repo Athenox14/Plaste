@@ -36,7 +36,8 @@ pub async fn init_schema(db: &hiqlite::Client) {
 
 type ApiErr = (StatusCode, &'static str);
 
-fn extract_mentions(body: &str) -> Vec<String> {
+/// `pub` pour la cible de fuzzing (caisse separee, API publique seulement).
+pub fn extract_mentions(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     for tok in body.split_whitespace() {
         if let Some(rest) = tok.strip_prefix('@') {

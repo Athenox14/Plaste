@@ -28,6 +28,48 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "files_parse_range"
+path = "fuzz_targets/files_parse_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sharing_sanitize_filename"
+path = "fuzz_targets/sharing_sanitize_filename.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "share_page_escape_html"
+path = "fuzz_targets/share_page_escape_html.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fulltext_extract"
+path = "fuzz_targets/fulltext_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_pad_id"
+path = "fuzz_targets/crypto_pad_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "comments_mentions"
+path = "fuzz_targets/comments_mentions.rs"
+test = false
+doc = false
+bench = false
+
 # Les cibles de fuzzing veulent des symboles de debogage ET de l'optimisation :
 # sans optimisation le debit s'ecroule, sans symboles un plantage est illisible.
 [profile.release]

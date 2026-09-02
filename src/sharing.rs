@@ -829,7 +829,8 @@ async fn download_public_share(
 
 /// Strips the characters that would let a filename break out of the quoted-string it's
 /// interpolated into, or inject an extra header: quotes, backslashes, CR/LF and other controls.
-fn sanitize_filename(name: &str) -> String {
+/// `pub` pour la cible de fuzzing (caisse separee, API publique seulement).
+pub fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter(|c| !c.is_control() && *c != '"' && *c != '\\')

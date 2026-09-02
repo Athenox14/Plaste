@@ -729,7 +729,9 @@ fn mime_for_ext(name: &str) -> String {
 /// malformed, `bytes=-N` suffix form), and the caller falls back to a full response.
 /// Parses a single-range `Range` header value (`bytes=start-end`, `bytes=start-`,
 /// or the suffix form `bytes=-len` meaning "last `len` bytes").
-fn parse_range(value: &str, total_len: usize) -> Option<(usize, usize)> {
+/// `pub` pour la cible de fuzzing (`fuzz/fuzz_targets/`), qui est une caisse
+/// separee ne voyant que l'API publique. Reste un detail d'implementation.
+pub fn parse_range(value: &str, total_len: usize) -> Option<(usize, usize)> {
     let spec = value.strip_prefix("bytes=")?;
     let (start_s, end_s) = spec.split_once('-')?;
     if start_s.is_empty() {

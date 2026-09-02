@@ -60,7 +60,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cible: [tus_metadata]
+        # Une cible = un job, donc tout tourne en parallele : ajouter une cible
+        # allonge la facture, pas le temps d'attente. `fail-fast: false` pour
+        # qu'un plantage sur une cible ne masque pas l'etat des autres.
+        cible:
+          - tus_metadata
+          - files_parse_range
+          - sharing_sanitize_filename
+          - share_page_escape_html
+          - fulltext_extract
+          - crypto_pad_id
+          - comments_mentions
 
     steps:
       - uses: actions/checkout@v5

@@ -39,7 +39,8 @@ struct PasswordForm {
 /// (filename, folder name, share token) goes through this before it is concatenated into the
 /// page — the filename in particular is chosen by whoever uploaded the file, so it is
 /// attacker-controlled as far as this page is concerned. The password is never echoed back.
-fn escape_html(s: &str) -> String {
+/// `pub` pour la cible de fuzzing (caisse separee, API publique seulement).
+pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

@@ -1,6 +1,19 @@
 name: Docker Image
 
 on:
+  # Construire a chaque poussee sur main, et pas seulement a la main. Sans ce
+  # declencheur, l'image de prod est restee 10 commits en arriere pendant des
+  # jours : le correctif d'envoi resumable etait ecrit, teste et fusionne, mais
+  # jamais publie, et la prod continuait de rejeter chaque tranche de 4 Mio
+  # (l'ancienne image n'ayant pas de limite explicite sur le routeur tus, axum
+  # appliquait sa valeur par defaut de 2 Mio). Un correctif non deploye ne
+  # corrige rien.
+  push:
+    branches: [main]
+    # La documentation seule ne change pas l'image.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch: {}
 
 env:

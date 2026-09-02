@@ -135,7 +135,8 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            match tiering_storage.run_tiering_sweep(30).await {
+            let (jours, plafond) = tiering::reglages();
+            match tiering_storage.run_tiering_sweep(jours, plafond).await {
                 Ok(n) if n > 0 => tracing::info!("tiering sweep migrated {n} chunks to cold"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("tiering sweep failed: {e}"),

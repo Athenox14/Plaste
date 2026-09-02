@@ -353,9 +353,9 @@ impl ChunkStore {
             if !used_shard_or_replica {
                 let _ = db
                     .execute(
-                        "INSERT INTO chunk_access (hash, tier, last_accessed) VALUES ($1, 'hot', $2) \
-                         ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2",
-                        hiqlite::params!(hash.to_string(), now),
+                        "INSERT INTO chunk_access (hash, tier, last_accessed, bytes) VALUES ($1, 'hot', $2, $3) \
+                         ON CONFLICT(hash) DO UPDATE SET tier = 'hot', last_accessed = $2, bytes = $3",
+                        hiqlite::params!(hash.to_string(), now, bytes.len() as i64),
                     )
                     .await;
             }
@@ -538,10 +538,51 @@ impl ChunkStore {
         }
     }
 
-    /// Migrates chunks not read in `cold_after_days` days from hot to cold storage. Returns
-    /// the number migrated. No-op (returns `Ok(0)`) if tiering isn't attached.
-    pub async fn run_tiering_sweep(&self, cold_after_days: i64) -> std::io::Result<u64> {
-        let (Some(db), Some(cold)) = (&self.db, &self.cold) else { return Ok(0) };
+    /// Deplace UN chunk du chaud vers le froid. Rend `false` si le blob n'existe
+    /// plus (deja ramasse par le gc) : ce n'est pas une erreur.
+    async fn demote_to_cold(&self, hash: &str) -> std::io::Result<bool> {
+        let (Some(db), Some(cold)) = (&self.db, &self.cold) else { return Ok(false) };
+        let path = self.path_for(hash);
+        let bytes = match self.op().read(&path).await {
+            Ok(b) => b.to_vec(),
+            Err(_) => return Ok(false),
+        };
+        // Ecrire le froid AVANT de supprimer le chaud : dans l'autre ordre, une
+        // interruption entre les deux perdrait le chunk. Ici le pire cas est un
+        // doublon, que la prochaine passe corrigera.
+        cold.write(&path, bytes).await.map_err(to_io_err)?;
+        self.op().delete(&path).await.map_err(to_io_err)?;
+        db.execute(
+            "UPDATE chunk_access SET tier = 'cold' WHERE hash = $1",
+            hiqlite::params!(hash.to_string()),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
+    /// Demeut les chunks du chaud vers le froid, en deux passes.
+    ///
+    /// 1. Par AGE : tout ce qui n'a pas ete lu depuis `cold_after_days` jours.
+    /// 2. Par TAILLE : si `hot_max_bytes` est donne et que le palier chaud le
+    ///    depasse, on demeut du moins recemment accede au plus recent jusqu'a
+    ///    repasser dessous.
+    ///
+    /// La seconde passe existe parce que la premiere ne borne RIEN : une rafale
+    /// d'envois sur une journee reste sous le seuil de temps tout en remplissant
+    /// le disque. Le palier chaud partageant `sda` avec le cluster, un
+    /// debordement y provoque une DiskPressure qui deborde sur tout le noeud.
+    ///
+    /// Rend le nombre de chunks deplaces. Sans palier attache, `Ok(0)`.
+    pub async fn run_tiering_sweep(
+        &self,
+        cold_after_days: i64,
+        hot_max_bytes: Option<i64>,
+    ) -> std::io::Result<u64> {
+        let Some(db) = &self.db else { return Ok(0) };
+        if self.cold.is_none() {
+            return Ok(0);
+        }
 
         struct HashRow {
             hash: String,
@@ -551,7 +592,18 @@ impl ChunkStore {
                 Self { hash: row.get("hash") }
             }
         }
+        struct TailleRow {
+            total: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for TailleRow {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { total: row.get("total") }
+            }
+        }
 
+        let mut migrated = 0u64;
+
+        // ---- passe 1 : age ----
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(cold_after_days)).to_rfc3339();
         let rows: Vec<HashRow> = db
             .query_map(
@@ -560,24 +612,111 @@ impl ChunkStore {
             )
             .await
             .map_err(std::io::Error::other)?;
-
-        let mut migrated = 0u64;
         for row in rows {
-            let path = self.path_for(&row.hash);
-            let bytes = match self.op().read(&path).await {
-                Ok(b) => b.to_vec(),
-                Err(_) => continue, // blob already gone (e.g. gc'd); skip
-            };
-            cold.write(&path, bytes).await.map_err(to_io_err)?;
-            self.op().delete(&path).await.map_err(to_io_err)?;
-            db.execute(
-                "UPDATE chunk_access SET tier = 'cold' WHERE hash = $1",
-                hiqlite::params!(row.hash),
+            if self.demote_to_cold(&row.hash).await? {
+                migrated += 1;
+            }
+        }
+
+        // ---- passe 2 : taille ----
+        let Some(plafond) = hot_max_bytes else { return Ok(migrated) };
+
+        // Rattrapage des lignes anterieures a la colonne `bytes` : sans elle
+        // elles comptent pour 0, et le palier paraitrait plus petit qu'il n'est
+        // — exactement l'erreur qui laisserait le disque se remplir. On les
+        // mesure sur le stockage, par lots bornes pour ne pas transformer un
+        // balayage en parcours integral.
+        {
+            struct AComplete {
+                hash: String,
+            }
+            impl From<&mut hiqlite::Row<'_>> for AComplete {
+                fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                    Self { hash: row.get("hash") }
+                }
+            }
+            let heritees: Vec<AComplete> = db
+                .query_map(
+                    "SELECT hash FROM chunk_access WHERE tier = 'hot' AND bytes = 0 LIMIT 5000",
+                    hiqlite::params!(),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+            for r in heritees {
+                let taille = match self.op().stat(&self.path_for(&r.hash)).await {
+                    Ok(m) => m.content_length() as i64,
+                    Err(_) => continue, // blob disparu : le gc s'en occupera
+                };
+                let _ = db
+                    .execute(
+                        "UPDATE chunk_access SET bytes = $1 WHERE hash = $2",
+                        hiqlite::params!(taille, r.hash),
+                    )
+                    .await;
+            }
+        }
+
+        let total: Option<TailleRow> = db
+            .query_map_optional(
+                "SELECT COALESCE(SUM(bytes), 0) AS total FROM chunk_access WHERE tier = 'hot'",
+                hiqlite::params!(),
             )
             .await
             .map_err(std::io::Error::other)?;
-            migrated += 1;
+        let mut chaud = total.map(|t| t.total).unwrap_or(0);
+        if chaud <= plafond {
+            return Ok(migrated);
         }
+        tracing::info!(
+            "palier chaud a {} octets pour un plafond de {} : demotion des plus anciens",
+            chaud, plafond
+        );
+
+        // Par lots : sans `LIMIT`, un palier a plusieurs millions de chunks
+        // chargerait tout en memoire pour n'en demouvoir qu'une fraction.
+        const LOT: i64 = 2000;
+        while chaud > plafond {
+            struct Candidat {
+                hash: String,
+                size: i64,
+            }
+            impl From<&mut hiqlite::Row<'_>> for Candidat {
+                fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                    Self { hash: row.get("hash"), size: row.get("size") }
+                }
+            }
+            let lot: Vec<Candidat> = db
+                .query_map(
+                    "SELECT hash, bytes AS size FROM chunk_access WHERE tier = 'hot' \
+                     ORDER BY last_accessed ASC LIMIT $1",
+                    hiqlite::params!(LOT),
+                )
+                .await
+                .map_err(std::io::Error::other)?;
+            if lot.is_empty() {
+                // Plus rien de demouvable alors qu'on est au-dessus du plafond :
+                // le palier est plein de chunks sans taille connue. On s'arrete
+                // plutot que de boucler indefiniment.
+                tracing::warn!("plafond du palier chaud non atteignable : plus aucun candidat");
+                break;
+            }
+            let mut progresse = false;
+            for c in lot {
+                if chaud <= plafond {
+                    break;
+                }
+                if self.demote_to_cold(&c.hash).await? {
+                    chaud -= c.size;
+                    migrated += 1;
+                    progresse = true;
+                }
+            }
+            if !progresse {
+                tracing::warn!("aucun chunk demouvable dans le lot : arret du balayage par taille");
+                break;
+            }
+        }
+
         Ok(migrated)
     }
 
@@ -698,6 +837,94 @@ mod tests {
         assert_eq!(read_back, data);
     }
 
+    /// L'invariant du plafond : des chunks TOUS recents (donc intouchables par
+    /// la passe d'age) doivent quand meme etre demus si le palier chaud depasse
+    /// la taille permise, et ce sont les moins recemment accedes qui partent.
+    ///
+    /// C'est precisement le cas que l'eviction par age ne couvrait pas, et qui
+    /// aurait laisse le disque se remplir.
+    #[tokio::test]
+    async fn le_plafond_de_taille_demeut_meme_des_chunks_recents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::init(dir.path().to_str().unwrap()).await;
+        crate::tiering::init_schema(&db).await;
+
+        let hot_dir = dir.path().join("chunks_hot");
+        let cold_dir = dir.path().join("chunks_cold");
+        tokio::fs::create_dir_all(&hot_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cold_dir).await.unwrap();
+        let store =
+            ChunkStore::new_fs(&hot_dir).with_tiering(ChunkStore::new_fs_cold(&cold_dir), db.clone());
+
+        // Trois contenus distincts, donc trois chunks, tous ecrits a l'instant.
+        let mut hashes = Vec::new();
+        for i in 0..3u8 {
+            let data = vec![b'a' + i; 40_000];
+            let (manifest, _) = store.write(&data).await.unwrap();
+            hashes.push(manifest[0].clone());
+        }
+
+        // Ordre d'anciennete d'acces explicite : hashes[0] le plus ancien.
+        for (rang, h) in hashes.iter().enumerate() {
+            let quand = (chrono::Utc::now() - chrono::Duration::minutes(30 - rang as i64))
+                .to_rfc3339();
+            db.execute(
+                "UPDATE chunk_access SET last_accessed = $1 WHERE hash = $2",
+                hiqlite::params!(quand, h.clone()),
+            )
+            .await
+            .unwrap();
+        }
+
+        struct T {
+            total: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for T {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { total: row.get("total") }
+            }
+        }
+        let avant: T = db
+            .query_map_one(
+                "SELECT COALESCE(SUM(bytes),0) AS total FROM chunk_access WHERE tier = 'hot'",
+                hiqlite::params!(),
+            )
+            .await
+            .unwrap();
+        assert!(avant.total > 0, "le palier chaud doit contenir quelque chose");
+
+        // Seuil d'age d'un an : la passe 1 ne peut RIEN demouvoir. Plafond a la
+        // moitie du volume : seule la passe de taille peut agir.
+        let plafond = avant.total / 2;
+        let migres = store.run_tiering_sweep(365, Some(plafond)).await.unwrap();
+        assert!(migres > 0, "le plafond doit avoir declenche des demotions");
+
+        let apres: T = db
+            .query_map_one(
+                "SELECT COALESCE(SUM(bytes),0) AS total FROM chunk_access WHERE tier = 'hot'",
+                hiqlite::params!(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            apres.total <= plafond,
+            "palier chaud a {} apres balayage, plafond {}",
+            apres.total,
+            plafond
+        );
+
+        // Le plus anciennement accede doit etre parti le premier, et son blob
+        // avoir change de place pour de vrai.
+        let froid = cold_dir.join(&hashes[0][0..2]).join(&hashes[0]);
+        assert!(froid.exists(), "le chunk le plus ancien doit etre dans le froid");
+        let chaud = hot_dir.join(&hashes[0][0..2]).join(&hashes[0]);
+        assert!(!chaud.exists(), "et avoir quitte le chaud");
+
+        // Le plus recemment accede doit avoir survecu.
+        let dernier = hot_dir.join(&hashes[2][0..2]).join(&hashes[2]);
+        assert!(dernier.exists(), "le plus recemment accede doit rester chaud");
+    }
+
     #[tokio::test]
     async fn tiering_sweep_migrates_cold_and_read_transparently_promotes_back_to_hot() {
         let dir = tempfile::tempdir().unwrap();
@@ -724,7 +951,7 @@ mod tests {
         .await
         .unwrap();
 
-        let migrated = store.run_tiering_sweep(1).await.unwrap();
+        let migrated = store.run_tiering_sweep(1, None).await.unwrap();
         assert_eq!(migrated, 1);
 
         let hot_path = hot_dir.join(&hash[0..2]).join(&hash);

@@ -300,13 +300,13 @@ async fn patch_upload(
         // peut etre perdue, la version est quand meme creee, et un HEAD ultérieur
         // (ou une reprise) voit un envoi termine.
         let etat = state.clone();
-        let jeton = ctx.clone();
+        let jeton = ctx.id;
         let identifiant = id.clone();
         let nom = upload.name.clone();
         let dossier = upload.folder_id;
         let base = upload.expected_base_version;
         let outcome = tokio::spawn(async move {
-            finish_upload(&etat, &jeton, &identifiant, &nom, dossier, base).await
+            finish_upload(&etat, jeton, &identifiant, &nom, dossier, base).await
         })
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "finalisation interrompue"))??;
@@ -325,9 +325,11 @@ async fn patch_upload(
 /// Assembles the completed partial file through the normal chunking+versioning pipeline,
 /// sharing `files::store_new_version` (chunk-refcount upsert + file_versions insert +
 /// `current_version_id` update) with the regular upload/office-save paths.
+/// Prend `owner_token_id` et non un `&TokenCtx` : seul l'identifiant du jeton
+/// servait, et la reprise au demarrage n'a pas de contexte de requete a fournir.
 async fn finish_upload(
     state: &AppState,
-    ctx: &TokenCtx,
+    owner_token_id: i64,
     id: &str,
     name: &str,
     folder_id: Option<i64>,
@@ -343,7 +345,7 @@ async fn finish_upload(
                 .db
                 .query_map_optional(
                     "SELECT id FROM files WHERE name = $1 AND folder_id = $2 AND owner_token_id = $3 AND deleted_at IS NULL",
-                    params!(name, fid, ctx.id),
+                    params!(name, fid, owner_token_id),
                 )
                 .await
         }
@@ -352,7 +354,7 @@ async fn finish_upload(
                 .db
                 .query_map_optional(
                     "SELECT id FROM files WHERE name = $1 AND folder_id IS NULL AND owner_token_id = $2 AND deleted_at IS NULL",
-                    params!(name, ctx.id),
+                    params!(name, owner_token_id),
                 )
                 .await
         }
@@ -368,7 +370,7 @@ async fn finish_upload(
             .db
             .execute_returning_map_one(
                 "INSERT INTO files (folder_id, name, owner_token_id, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-                params!(folder_id, name, ctx.id, created_at.clone()),
+                params!(folder_id, name, owner_token_id, created_at.clone()),
             )
             .await
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
@@ -376,7 +378,7 @@ async fn finish_upload(
     };
 
     let outcome = crate::files::store_new_version_from_path(
-        state, file_id, &chemin_partiel, expected_base_version, ctx.id,
+        state, file_id, &chemin_partiel, expected_base_version, owner_token_id,
     ).await?;
     let size = match &outcome {
         crate::files::StoreOutcome::Normal { size, .. } | crate::files::StoreOutcome::Conflict { size, .. } => *size,
@@ -386,7 +388,7 @@ async fn finish_upload(
         .db
         .execute(
             "UPDATE tokens SET used_bytes = used_bytes + $1 WHERE id = $2",
-            params!(size, ctx.id),
+            params!(size, owner_token_id),
         )
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
@@ -400,10 +402,84 @@ async fn finish_upload(
     let _ = tokio::fs::remove_file(partial_path(id)).await;
 
     if !matches!(outcome, crate::files::StoreOutcome::Conflict { .. }) {
-        crate::audit::log(&state.db, ctx.id, "file.upload.tus", Some("file"), Some(file_id), None).await;
+        crate::audit::log(&state.db, owner_token_id, "file.upload.tus", Some("file"), Some(file_id), None).await;
     }
 
     Ok(outcome)
+}
+
+/// Reprend les envois entierement recus mais jamais assembles.
+///
+/// POURQUOI. Un envoi tus vit en deux temps : les tranches remplissent un
+/// fichier partiel, puis la derniere declenche l'assemblage (decoupage,
+/// chiffrement, creation de la version). Entre les deux il existe une fenetre ou
+/// `uploaded_bytes == total_size` mais `completed == 0` : tous les octets du
+/// client sont sur le disque, et rien ne les represente encore.
+///
+/// Si le service s'arrete dans cette fenetre — redemarrage, deploiement, plantage
+/// — personne ne reprend le travail. Le client a envoye son fichier, l'a vu
+/// atteindre 100 %, et voit un fichier a 0 octet. Constate en prod le 02/09/2026
+/// sur 1,05 Go.
+///
+/// On rejoue donc ces envois au demarrage et periodiquement. C'est idempotent :
+/// `finish_upload` remet `completed = 1` et supprime le fichier partiel, donc un
+/// envoi deja repris ne ressort pas de la requete.
+pub async fn reprendre_envois_inacheves(state: &AppState) {
+    let en_attente: Vec<UploadRow> = match state
+        .db
+        .query_map(
+            "SELECT id, owner_token_id, folder_id, name, total_size, uploaded_bytes, completed, \
+             expected_base_version FROM tus_uploads \
+             WHERE completed = 0 AND uploaded_bytes > 0 AND uploaded_bytes = total_size",
+            params!(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("reprise des envois tus impossible : {e}");
+            return;
+        }
+    };
+
+    if en_attente.is_empty() {
+        return;
+    }
+    tracing::info!("reprise de {} envoi(s) tus recu(s) mais non assemble(s)", en_attente.len());
+
+    for envoi in en_attente {
+        // Le fichier partiel est la seule source des octets : sans lui, l'envoi
+        // n'est pas reprenable et le rejouer ecrirait un fichier tronque.
+        let chemin = partial_path(&envoi.id);
+        match tokio::fs::metadata(&chemin).await {
+            Ok(m) if m.len() as i64 == envoi.total_size => {}
+            Ok(m) => {
+                tracing::warn!(
+                    "envoi {} ignore : le fichier partiel fait {} octets pour {} attendus",
+                    envoi.id, m.len(), envoi.total_size
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("envoi {} ignore : fichier partiel absent", envoi.id);
+                continue;
+            }
+        }
+
+        match finish_upload(
+            state,
+            envoi.owner_token_id,
+            &envoi.id,
+            &envoi.name,
+            envoi.folder_id,
+            envoi.expected_base_version,
+        )
+        .await
+        {
+            Ok(_) => tracing::info!("envoi {} assemble ({} octets)", envoi.id, envoi.total_size),
+            Err((_, msg)) => tracing::error!("assemblage de l'envoi {} echoue : {msg}", envoi.id),
+        }
+    }
 }
 
 // ---------- DELETE /tus/uploads/{id} (Termination) ----------

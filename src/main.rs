@@ -100,6 +100,25 @@ async fn main() {
     auth::bootstrap_admin(&state).await;
     breadcrumb!("auth::bootstrap_admin returned");
 
+    // Reprise des envois tus recus mais jamais assembles. Immediatement au
+    // demarrage — c'est le cas qui compte, puisqu'un arret pendant l'assemblage
+    // est justement ce qui les laisse en plan — puis toutes les 10 min pour
+    // rattraper un assemblage interrompu en cours de vie du processus.
+    //
+    // Detache : un envoi de plusieurs Go a assembler ne doit pas retarder
+    // l'ouverture du port, sinon un seul fichier en attente rendrait le service
+    // injoignable au demarrage.
+    let reprise_state = state.clone();
+    tokio::spawn(async move {
+        tus::reprendre_envois_inacheves(&reprise_state).await;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        interval.tick().await; // le premier tick est immediat, on vient de le faire
+        loop {
+            interval.tick().await;
+            tus::reprendre_envois_inacheves(&reprise_state).await;
+        }
+    });
+
     // ponytail: fixed 1h cadence, not configurable; add a config knob if ops ever need finer control.
     let retention_state = state.clone();
     tokio::spawn(async move {

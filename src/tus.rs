@@ -284,15 +284,32 @@ async fn patch_upload(
     headers.insert("upload-offset", new_offset.to_string().parse().unwrap());
     headers.insert("tus-resumable", TUS_VERSION.parse().unwrap());
     if new_offset == upload.total_size {
-        let outcome = finish_upload(
-            &state,
-            &ctx,
-            &id,
-            &upload.name,
-            upload.folder_id,
-            upload.expected_base_version,
-        )
-        .await?;
+        // DETACHE dans une tache, et pas simplement `.await` ici : axum abandonne
+        // le futur du handler des que le client se deconnecte, ce qui interrompait
+        // la finalisation EN COURS DE ROUTE.
+        //
+        // Constate en prod le 02/09/2026 sur un fichier de 1,05 Go : les
+        // 1 132 793 393 octets etaient tous arrives (`uploaded_bytes` =
+        // `total_size`), des chunks etaient deja ecrits, mais le
+        // `UPDATE ... completed = 1` plus bas n'etait jamais atteint. Le client
+        // (undici, cote OxaDash) abandonne au bout de 300 s alors que decouper et
+        // chiffrer 1 Go prend davantage — donc l'envoi restait a `completed = 0`
+        // et le fichier s'affichait a 0 octet.
+        //
+        // `tokio::spawn` rend le travail non annulable par le client : la reponse
+        // peut etre perdue, la version est quand meme creee, et un HEAD ultérieur
+        // (ou une reprise) voit un envoi termine.
+        let etat = state.clone();
+        let jeton = ctx.clone();
+        let identifiant = id.clone();
+        let nom = upload.name.clone();
+        let dossier = upload.folder_id;
+        let base = upload.expected_base_version;
+        let outcome = tokio::spawn(async move {
+            finish_upload(&etat, &jeton, &identifiant, &nom, dossier, base).await
+        })
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "finalisation interrompue"))??;
         if let crate::files::StoreOutcome::Conflict { conflicted_copy_file_id, conflicted_copy_name, .. } = outcome {
             headers.insert("x-conflict", "true".parse().unwrap());
             headers.insert("x-conflicted-copy-file-id", conflicted_copy_file_id.to_string().parse().unwrap());

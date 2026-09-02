@@ -32,9 +32,31 @@ RUN --mount=type=cache,id=plaste-cargo-registry,sharing=locked,target=/usr/local
     cargo build --release && rm -rf src
 
 COPY src ./src
+# Detruire les artefacts DU CRATE avant le vrai build. Les dependances restent
+# dans le cache — c'est tout l'interet du pre-build — mais le binaire factice et
+# son empreinte disparaissent.
+#
+# Sans ca, cargo ne recompilait pas : BuildKit normalise les mtime des fichiers
+# copies, donc les sources reelles paraissent plus vieilles que les artefacts du
+# pre-build et sont jugees inchangees. Le `cp` exportait alors le binaire
+# `fn main() {}` : 450 Ko qui sortent avec le code 0 sans rien afficher, soit un
+# CrashLoopBackOff dont chaque etat est « Completed ». Constate le 02/09/2026,
+# mais deja livre par le build du 31/08 sans que personne ne le voie.
+#
+# Le `test` de taille est la garde qui manquait : un no-op ne doit plus jamais
+# pouvoir passer pour un serveur. Le binaire reel depasse largement 5 Mo
+# (tantivy, hiqlite, rustls).
 RUN --mount=type=cache,id=plaste-cargo-registry,sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=plaste-cargo-target,sharing=locked,target=/app/target \
-    cargo build --release && cp target/release/plaste /app/plaste
+    rm -f target/release/plaste \
+    && rm -rf target/release/.fingerprint/plaste-* \
+    && cargo build --release \
+    && taille=$(stat -c%s target/release/plaste) \
+    && if [ "$taille" -lt 5000000 ]; then \
+         echo "ERREUR: binaire de ${taille} octets — le pre-build factice a ete livre" >&2; \
+         exit 1; \
+       fi \
+    && cp target/release/plaste /app/plaste
 
 # ---- runtime stage ----
 # debian:bookworm-slim (not distroless): hiqlite (sqlite) and reqwest/rustls need a

@@ -492,10 +492,21 @@ impl ChunkStore {
                 Err(e) => last_err = Some(e),
             }
         }
+        // Derniere chance : le chemin conscient du tiering. `chunk_locations`
+        // n'enregistre QUE le backend d'ecriture ; la retrogradation vers le
+        // palier froid deplace le fichier sans toucher ces lignes. Un chunk
+        // ecrit sur le backend fs primaire puis passe au froid avait donc une
+        // ligne pointant vers /data/chunks, ou il n'est plus — et cette branche
+        // rendait NotFound sans jamais essayer /data/chunks_cold. Le 05/09/2026
+        // les 893 chunks de la prod sont partis au froid d'un coup : plus AUCUN
+        // fichier telechargeable, avec un simple « Telechargement echoue ».
+        if let Ok(bytes) = self.read_legacy(hash).await {
+            return Ok(bytes);
+        }
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "chunk {hash}: all {} known location(s) failed to read; last error: {}",
+                "chunk {hash}: all {} known location(s) failed to read, and the tiering fallback found nothing either; last error: {}",
                 locations.len(),
                 last_err.map(|e| e.to_string()).unwrap_or_else(|| "none".to_string())
             ),
@@ -1026,6 +1037,60 @@ mod tests {
             .await
             .unwrap();
         row.id
+    }
+
+    /// Regression : `chunk_locations` n'enregistre que le backend d'ECRITURE, et
+    /// la retrogradation vers le froid deplace le blob sans toucher ces lignes.
+    /// La branche « locations » rendait donc NotFound sans jamais essayer le
+    /// palier froid. En prod le 05/09/2026, les 893 chunks sont passes au froid
+    /// d'un coup : plus aucun fichier telechargeable.
+    #[tokio::test]
+    async fn un_chunk_avec_une_location_reste_lisible_apres_passage_au_froid() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::init(dir.path().to_str().unwrap()).await;
+        crate::storage_backends::init_schema(&db).await;
+        crate::tiering::init_schema(&db).await;
+
+        let hot_dir = dir.path().join("chunks_hot");
+        let cold_dir = dir.path().join("chunks_cold");
+        tokio::fs::create_dir_all(&hot_dir).await.unwrap();
+        tokio::fs::create_dir_all(&cold_dir).await.unwrap();
+        let store = ChunkStore::new_fs(&hot_dir)
+            .with_tiering(ChunkStore::new_fs_cold(&cold_dir), db.clone());
+
+        // Le backend chaud est enregistre : l'ecriture pose donc une ligne
+        // chunk_locations, exactement comme la prod (ligne « bootstrap »).
+        insert_backend(&db, "bootstrap", &hot_dir, "primary").await;
+
+        let data = b"contenu qui doit rester lisible une fois passe au froid".to_vec();
+        let (manifest, _) = store.write(&data).await.unwrap();
+        let hash = &manifest[0];
+
+        // Precondition du test : sans ligne chunk_locations, la lecture prendrait
+        // read_legacy directement et ce test passerait meme sans le correctif.
+        struct N {
+            n: i64,
+        }
+        impl From<&mut hiqlite::Row<'_>> for N {
+            fn from(row: &mut hiqlite::Row<'_>) -> Self {
+                Self { n: row.get("n") }
+            }
+        }
+        let rows: Vec<N> = db
+            .query_map(
+                "SELECT COUNT(*) as n FROM chunk_locations WHERE hash = $1",
+                hiqlite::params!(hash),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].n, 1, "le test doit passer par la branche chunk_locations");
+
+        assert!(store.demote_to_cold(hash).await.unwrap(), "le chunk doit partir au froid");
+        let rel = format!("{}/{hash}", &hash[0..2]);
+        assert!(!hot_dir.join(&rel).exists(), "le blob ne doit plus etre au chaud");
+        assert!(cold_dir.join(&rel).exists(), "le blob doit etre au froid");
+
+        assert_eq!(store.read_chunk(hash).await.unwrap(), data);
     }
 
     async fn setup_store_with_db() -> (ChunkStore, hiqlite::Client, tempfile::TempDir) {

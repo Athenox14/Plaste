@@ -360,12 +360,30 @@ async fn dav(
     }
 }
 
+/// Ajoute `WWW-Authenticate` a tout 401 du sous-arbre WebDAV.
+///
+/// Sans cet en-tete, un client fait sa premiere requete sans identifiants,
+/// recoit un 401 nu, et ABANDONNE au lieu de reessayer en Basic — le montage
+/// echoue alors sans raison visible. Les clients d'API, eux, envoient le jeton
+/// d'emblee et ne dependent pas de ce defi ; c'est pourquoi il est pose ici et
+/// non sur tout le service.
+async fn defi_authentification(mut reponse: Response) -> Response {
+    if reponse.status() == StatusCode::UNAUTHORIZED {
+        reponse.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Basic realm=\"Plaste\""),
+        );
+    }
+    reponse
+}
+
 pub fn router() -> Router<AppState> {
     // `any` : PROPFIND n'est pas une methode HTTP standard, axum n'a pas de
     // routeur dedie. On aiguille nous-memes sur la methode.
     Router::new()
         .route("/dav", any(dav_racine))
         .route("/dav/{*chemin}", any(dav))
+        .layer(axum::middleware::map_response(defi_authentification))
 }
 
 /// `/dav` sans chemin = la racine du jeton.

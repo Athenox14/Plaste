@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, groups, keymgmt, konnect, mcp,
+use plaste::{admin, audit, auth, chunk_upload, comments, db, files, folders, gc, graphql, dav, groups, keymgmt, konnect, mcp,
     ratelimit, retention, search, share_page, sharing, state::AppState, storage, storage_backends, tags, tiering, trash, tus};
 
 // TEMPORARY: startup breadcrumbs for diagnosing a silent-exit-0 bug that only reproduces
@@ -194,6 +194,7 @@ async fn main() {
         .merge(groups::router())
         .merge(keymgmt::router())
         .merge(konnect::router())
+        .merge(dav::router())
         .merge(mcp::router())
         .merge(retention::router())
         .merge(search::router())

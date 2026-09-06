@@ -755,6 +755,90 @@ pub fn parse_range(value: &str, total_len: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Sert le contenu d'un fichier, avec gestion de la plage (`Range`).
+///
+/// Extraite de `preview` pour que WebDAV (`dav.rs`) serve exactement le même
+/// contenu, avec les mêmes en-têtes et le même comportement sur les plages —
+/// dont dépend la lecture vidéo. Dupliquer aurait fait diverger les deux au
+/// premier correctif.
+///
+/// **NE FAIT AUCUN CONTRÔLE DE DROIT** : l'appelant a déjà vérifié que le
+/// demandeur possède ce fichier. C'est volontaire, mais c'est aussi le piège —
+/// ne jamais l'appeler sur un identifiant venu directement du client.
+///
+/// ponytail: charge le fichier entier en mémoire avant de découper la plage
+/// (comportement d'origine). Coûteux sur de la vidéo, où chaque saut relit tout
+/// le fichier ; à convertir en lecture par chunks si la mémoire devient un
+/// problème.
+pub async fn servir_contenu(
+    state: &AppState,
+    file_id: i64,
+    nom: &str,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let fichier: Option<FileRow> = state
+        .db
+        .query_map_optional("SELECT * FROM files WHERE id = $1", params!(file_id))
+        .await
+        .unwrap_or(None);
+    let Some(fichier) = fichier else {
+        return (StatusCode::NOT_FOUND, "file not found").into_response();
+    };
+    let Some(cur_id) = fichier.current_version_id else {
+        return (StatusCode::NOT_FOUND, "no current version").into_response();
+    };
+    let version: Option<VersionRow> = state
+        .db
+        .query_map_optional(
+            "SELECT id, version_no, size, manifest, created_at FROM file_versions WHERE id = $1",
+            params!(cur_id),
+        )
+        .await
+        .unwrap_or(None);
+    let Some(version) = version else {
+        return (StatusCode::NOT_FOUND, "version not found").into_response();
+    };
+    let Ok(manifest) = serde_json::from_str::<Vec<String>>(&version.manifest) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "decode error").into_response();
+    };
+    let Ok(data) = state.storage.read_manifest(&manifest).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "storage read failed").into_response();
+    };
+
+    let mime = mime_for_ext(nom).to_string();
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_range(v, data.len()));
+
+    match range {
+        Some((start, end)) => (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CONTENT_LENGTH, (end - start + 1).to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", data.len()),
+                ),
+            ],
+            data[start..=end].to_vec(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CONTENT_LENGTH, data.len().to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+            data,
+        )
+            .into_response(),
+    }
+}
+
 async fn preview(
     State(state): State<AppState>,
     ctx: TokenCtx,

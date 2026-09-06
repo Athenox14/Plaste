@@ -5,6 +5,7 @@ pub mod auth;
 pub mod chunk_upload;
 pub mod comments;
 pub mod crypto;
+pub mod dav;
 pub mod db;
 pub mod files;
 pub mod folders;

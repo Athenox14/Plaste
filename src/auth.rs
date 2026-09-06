@@ -53,12 +53,24 @@ impl FromRequestParts<AppState> for TokenCtx {
         // jeton doit agir avec CE jeton, même si un cookie traîne dans la
         // requête. Le cookie est résolu vers le MÊME `TokenCtx`, donc tout le
         // reste du service ignore par quel chemin l'appelant est arrivé.
-        let bearer = parts
+        let entete = parts
             .headers
             .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .map(str::to_string);
+            .and_then(|v| v.to_str().ok());
+
+        // `Basic` est accepté en plus de `Bearer` : les clients WebDAV standards
+        // (davfs2, gestionnaires de fichiers de bureau) ne savent envoyer que
+        // ça. Le mot de passe EST le jeton, l'identifiant est ignoré — même
+        // secret, même force, seul l'encodage change.
+        let bearer = entete.and_then(|h| {
+            if let Some(t) = h.strip_prefix("Bearer ") {
+                return Some(t.to_string());
+            }
+            let b64 = h.strip_prefix("Basic ")?;
+            let brut = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()?;
+            let paire = String::from_utf8(brut).ok()?;
+            paire.split_once(':').map(|(_, mdp)| mdp.to_string())
+        });
 
         let requete = match bearer {
             Some(t) => (

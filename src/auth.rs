@@ -44,21 +44,48 @@ impl FromRequestParts<AppState> for TokenCtx {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let header = parts
+        // Deux façons de s'authentifier, dans cet ordre :
+        //
+        // 1. `Authorization: Bearer <jeton>` — clients d'API et de bureau ;
+        // 2. cookie de session — connexion KonnectID (voir `konnect.rs`).
+        //
+        // Le Bearer garde la priorité : un client qui envoie explicitement un
+        // jeton doit agir avec CE jeton, même si un cookie traîne dans la
+        // requête. Le cookie est résolu vers le MÊME `TokenCtx`, donc tout le
+        // reste du service ignore par quel chemin l'appelant est arrivé.
+        let bearer = parts
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .ok_or((StatusCode::UNAUTHORIZED, "missing authorization header"))?;
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or((StatusCode::UNAUTHORIZED, "expected Bearer token"))?;
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::to_string);
+
+        let requete = match bearer {
+            Some(t) => (
+                "SELECT id, owner, is_admin, quota_bytes, used_bytes, expires_at FROM tokens WHERE token = $1",
+                t,
+            ),
+            None => {
+                let sid = parts
+                    .headers
+                    .get("cookie")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(session_depuis_cookies)
+                    .ok_or((StatusCode::UNAUTHORIZED, "missing authorization header"))?;
+                (
+                    // La session doit être valide ET non expirée : une ligne
+                    // périmée ne vaut pas mieux qu'un cookie inventé.
+                    "SELECT t.id, t.owner, t.is_admin, t.quota_bytes, t.used_bytes, t.expires_at \
+                     FROM sessions s JOIN tokens t ON t.id = s.token_id \
+                     WHERE s.id = $1 AND s.expires_at > datetime('now')",
+                    sid,
+                )
+            }
+        };
 
         let ctx: Option<TokenCtx> = state
             .db
-            .query_map_optional(
-                "SELECT id, owner, is_admin, quota_bytes, used_bytes, expires_at FROM tokens WHERE token = $1",
-                params!(token),
-            )
+            .query_map_optional(requete.0, params!(requete.1))
             .await
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "db error"))?;
 
@@ -67,6 +94,47 @@ impl FromRequestParts<AppState> for TokenCtx {
             return Err((StatusCode::UNAUTHORIZED, "token expired"));
         }
         Ok(ctx)
+    }
+}
+
+/// Extrait le cookie de session d'un en-tête `Cookie` brut.
+///
+/// Écrit à la main : aucune bibliothèque de cookies n'est dans les dépendances,
+/// et en ajouter une pour lire une paire clé/valeur serait disproportionné.
+/// On compare le nom exact après découpage, jamais par `contains` — sinon un
+/// cookie nommé `autre_plaste_session` passerait pour le bon.
+pub fn session_depuis_cookies(brut: &str) -> Option<String> {
+    brut.split(';')
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| *k == crate::konnect::SESSION_COOKIE)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests_cookies {
+    use super::session_depuis_cookies;
+
+    #[test]
+    fn trouve_le_cookie_parmi_d_autres() {
+        assert_eq!(
+            session_depuis_cookies("theme=dark; plaste_session=abc123; lang=fr"),
+            Some("abc123".to_string())
+        );
+    }
+
+    /// Le piege : un `contains` naif accepterait `autre_plaste_session`, ce qui
+    /// laisserait n'importe quel cookie tiers usurper une session.
+    #[test]
+    fn refuse_un_nom_qui_se_termine_par_le_bon() {
+        assert_eq!(session_depuis_cookies("autre_plaste_session=vole"), None);
+    }
+
+    #[test]
+    fn refuse_une_valeur_vide_ou_absente() {
+        assert_eq!(session_depuis_cookies("plaste_session="), None);
+        assert_eq!(session_depuis_cookies("theme=dark"), None);
+        assert_eq!(session_depuis_cookies(""), None);
     }
 }
 

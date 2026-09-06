@@ -13,6 +13,7 @@ pub mod gc;
 pub mod graphql;
 pub mod groups;
 pub mod keymgmt;
+pub mod konnect;
 pub mod mcp;
 pub mod ratelimit;
 pub mod retention;

@@ -104,6 +104,25 @@ const ALTERS: &[&str] = &[
     "ALTER TABLE shares ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE shares ADD COLUMN download_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE shares ADD COLUMN last_access_at TEXT",
+    // Connexion KonnectID (konnect.rs). Une session est rattachee a un JETON,
+    // pas a un utilisateur : c'est le jeton qui porte deja le quota, les droits
+    // et la propriete des fichiers. Se connecter ne fait donc que retrouver le
+    // jeton correspondant a l'email, jamais en creer un.
+    r#"CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        token_id INTEGER NOT NULL REFERENCES tokens(id),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )"#,
+    // Verificateur PKCE en attente entre l'aller et le retour d'autorisation.
+    // En base et non en memoire : il doit survivre a un redemarrage, et la ligne
+    // fait office de jeton a usage unique contre le rejeu d'un code.
+    r#"CREATE TABLE IF NOT EXISTS oauth_states (
+        state TEXT PRIMARY KEY,
+        verifier TEXT NOT NULL,
+        redirect_to TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )"#,
 ];
 
 /// Starts a single-node embedded hiqlite instance (no clustering) rooted at `path`,

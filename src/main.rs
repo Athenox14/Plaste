@@ -194,7 +194,6 @@ async fn main() {
         .merge(groups::router())
         .merge(keymgmt::router())
         .merge(konnect::router())
-        .merge(dav::router())
         .merge(mcp::router())
         .merge(retention::router())
         .merge(search::router())
@@ -210,18 +209,31 @@ async fn main() {
         .merge(tus::router()
             .layer(upload_limit)
             .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(general_limit)
-        // ponytail: permissive CORS — this is a self-hosted server behind bearer-token auth,
-        // not cookie-based sessions, so a wide-open Access-Control-Allow-Origin carries no
-        // CSRF-style risk here; tighten to an allowlist if that assumption ever changes.
+        // CORS permissif : serveur auto-heberge, authentifie par jeton porteur.
+        //
+        // Depuis l'ajout des sessions KonnectID (konnect.rs), l'affirmation
+        // « pas de session par cookie » n'est PLUS vraie. Ca reste sans risque
+        // CSRF pour deux raisons cumulees, a ne pas casser separement :
+        // `Access-Control-Allow-Origin: *` sans `Allow-Credentials` empeche tout
+        // navigateur d'attacher le cookie en cross-origin, et le cookie est pose
+        // en `SameSite=Lax`, ce qui bloque son envoi sur une requete cross-site
+        // non-navigationnelle. Si l'un des deux saute, il faut une liste
+        // blanche d'origines.
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
-        );
+        )
+        // WebDAV monte APRES la couche CORS, volontairement : CorsLayer repond
+        // lui-meme a TOUT OPTIONS, donc l'en-tete `DAV: 1` de notre gestionnaire
+        // n'atteignait jamais le client — et sans lui, davfs2 refuse de monter
+        // la ressource. Verifie en prod : OPTIONS rendait 200 avec les seuls
+        // en-tetes access-control-*.
+        .merge(dav::router().with_state(state));
     breadcrumb!("router built");
 
     let port = std::env::var("PLASTE_PORT").unwrap_or_else(|_| "8080".to_string());

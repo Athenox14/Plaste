@@ -30,6 +30,10 @@ pub fn router() -> Router<AppState> {
             axum::routing::get(download_public_share),
         )
         .route(
+            "/public/shares/{share_token}/raw",
+            axum::routing::get(raw_public_share),
+        )
+        .route(
             "/permissions",
             axum::routing::post(create_permission).get(list_permissions),
         )
@@ -725,6 +729,55 @@ async fn download_public_share(
     headers: HeaderMap,
     Query(q): Query<DownloadQuery>,
 ) -> Result<impl IntoResponse, ApiErr> {
+    serve_public_file(state, share_token, headers, q, false).await
+}
+
+/// `GET /public/shares/{token}/raw` — the same file, but displayable in place: an `<img>` tag,
+/// a forum post or a README can point straight at it. Only for types that cannot carry script
+/// (see `inline_safe_mime`); anything else falls back to the forced download of `/download`.
+async fn raw_public_share(
+    State(state): State<AppState>,
+    Path(share_token): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<DownloadQuery>,
+) -> Result<impl IntoResponse, ApiErr> {
+    serve_public_file(state, share_token, headers, q, true).await
+}
+
+/// MIME type under which a shared file may be served INLINE, from its extension — `None` means
+/// "download only".
+///
+/// Security: a closed allowlist of formats a browser renders without running code. SVG is
+/// deliberately absent (it is XML and can embed `<script>`), as are HTML, XML and PDF. The
+/// extension comes from the uploader, but mislabeling only changes how the bytes are
+/// *interpreted*: an `.png` holding HTML is served as `image/png` with `nosniff`, and the
+/// browser renders a broken image, never a page.
+pub fn inline_safe_mime(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => return None,
+    })
+}
+
+async fn serve_public_file(
+    state: AppState,
+    share_token: String,
+    headers: HeaderMap,
+    q: DownloadQuery,
+    inline: bool,
+) -> Result<axum::response::Response, ApiErr> {
     let share =
         load_valid_share_inner(&state, &share_token, header_password(&headers), q.t.as_deref())
             .await?;
@@ -808,6 +861,26 @@ async fn download_public_share(
         }
     });
 
+    // Inline only for an allowlisted, script-free type (see `inline_safe_mime`).
+    if let Some(mime) = inline.then(|| inline_safe_mime(&name)).flatten() {
+        let headers = [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (header::CONTENT_LENGTH, version.size.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{}\"", sanitize_filename(&name)),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            // Belt and braces: even if a type on the allowlist were ever rendered as a
+            // document, a sandboxed CSP forbids it any script or subresource.
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox".to_string()),
+            // Hotlinked images get hit on every page view; revocation still takes effect
+            // within this window.
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+        ];
+        return Ok((headers, axum::body::Body::from_stream(stream)).into_response());
+    }
+
     let headers = [
         // Security: always `application/octet-stream` + `attachment`, never the guessed MIME
         // type. A user can upload an .html (or .svg, or anything with inline scripting) and
@@ -824,7 +897,7 @@ async fn download_public_share(
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
     ];
 
-    Ok((headers, axum::body::Body::from_stream(stream)))
+    Ok((headers, axum::body::Body::from_stream(stream)).into_response())
 }
 
 /// Strips the characters that would let a filename break out of the quoted-string it's
@@ -1054,6 +1127,17 @@ mod tests {
     use tower::ServiceExt;
 
     // ---------- pure unit tests: token, password, expiry, filename ----------
+
+    #[test]
+    fn inline_allowlist_keeps_scriptable_types_out() {
+        assert_eq!(inline_safe_mime("photo.PNG"), Some("image/png"));
+        assert_eq!(inline_safe_mime("a.b.jpeg"), Some("image/jpeg"));
+        assert_eq!(inline_safe_mime("clip.webm"), Some("video/webm"));
+        // Anything that can carry script, and anything unknown, is download-only.
+        for name in ["logo.svg", "page.html", "page.htm", "doc.pdf", "data.xml", "x.js", "noext", "trailingdot."] {
+            assert_eq!(inline_safe_mime(name), None, "{name} must not be served inline");
+        }
+    }
 
     #[test]
     fn share_token_has_128_bits_of_entropy_and_is_unpredictable() {
@@ -1404,6 +1488,51 @@ mod tests {
         assert_eq!(listed[0]["download_count"], 1);
         assert!(listed[0]["last_access_at"].is_string());
         assert_eq!(listed[0]["password_protected"], false);
+
+        // --- /raw on an .html file must NOT render it: same inert download as /download ---
+        let (status, headers, body) =
+            public_get(&state, &format!("/public/shares/{token}/raw")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, content);
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/octet-stream");
+        assert!(headers
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"));
+
+        // --- /raw on an image: displayed in place, sandboxed ---
+        state
+            .db
+            .execute(
+                "UPDATE files SET name = 'photo.PNG' WHERE id = $1",
+                params!(file_id),
+            )
+            .await
+            .unwrap();
+        let (status, headers, body) =
+            public_get(&state, &format!("/public/shares/{token}/raw")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, content);
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert!(headers
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("inline;"));
+        assert!(headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("sandbox"));
+        // /download stays a forced download whatever the type.
+        let (_, headers, _) =
+            public_get(&state, &format!("/public/shares/{token}/download")).await;
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/octet-stream");
 
         // --- revoked share is refused immediately, on the very next request ---
         let resp = router()

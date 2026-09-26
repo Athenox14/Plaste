@@ -382,6 +382,11 @@ pub fn router() -> Router<AppState> {
     // routeur dedie. On aiguille nous-memes sur la methode.
     Router::new()
         .route("/dav", any(dav_racine))
+        // La racine AVEC la barre finale : c'est la forme qu'emploient rclone
+        // (et la plupart des clients) pour un dossier. `{*chemin}` n'accepte
+        // pas un chemin vide, `/dav/` tombait donc en 404 — racine
+        // « introuvable », montage vide (LumiR ne voyait aucun fichier).
+        .route("/dav/", any(dav_racine))
         .route("/dav/{*chemin}", any(dav))
         .layer(axum::middleware::map_response(defi_authentification))
 }

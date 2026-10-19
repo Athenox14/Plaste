@@ -12,6 +12,14 @@ const MIN: usize = 256 * 1024;
 const AVG: usize = 1024 * 1024;
 const MAX: usize = 4 * 1024 * 1024;
 const NONCE_LEN: usize = 12;
+/// Etiquette d'authentification AES-GCM ajoutee au texte chiffre.
+const GCM_TAG_LEN: usize = 16;
+
+/// Taille en clair de chaque chunk deja vue (un chunk est adresse par son contenu : sa taille ne change
+/// jamais). Evite de refaire un `stat` + une requete par chunk a chaque lecture partielle d'un gros fichier.
+/// Plafonnee : au-dela, on repart de zero plutot que de grossir sans fin.
+static TAILLES_CHUNKS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> = std::sync::OnceLock::new();
+const TAILLES_CHUNKS_MAX: usize = 500_000;
 
 /// Directory the master encryption key is persisted under, independent of storage backend
 /// (S3-backed stores still need a local place to keep the key). `PLASTE_DATA_DIR`, default
@@ -467,6 +475,68 @@ impl ChunkStore {
         Ok(out)
     }
 
+    /// Taille EN CLAIR d'un chunk, sans le lire ni le dechiffrer : on mesure le blob stocke (`stat`) et on
+    /// retranche l'en-tete (identifiant de cle + nonce) et l'etiquette GCM. C'est ce qui permet de trouver
+    /// le chunk qui contient un decalage donne sans relire tout ce qui precede.
+    pub async fn chunk_plain_len(&self, hash: &str) -> std::io::Result<u64> {
+        let cache = TAILLES_CHUNKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        if let Some(n) = cache.lock().unwrap().get(hash) {
+            return Ok(*n);
+        }
+        let path = self.path_for(hash);
+        let mut stocke: Option<u64> = None;
+        for loc in self.locations_for(hash).await {
+            let Ok(cfg) = loc.config_json() else { continue };
+            let Ok(op) = Self::build_operator(&loc.kind, &cfg) else { continue };
+            if let Ok(m) = op.stat(&path).await {
+                stocke = Some(m.content_length());
+                break;
+            }
+        }
+        if stocke.is_none() {
+            // Meme ordre que `read_legacy` : palier chaud, puis froid.
+            if let Ok(m) = self.op().stat(&path).await {
+                stocke = Some(m.content_length());
+            } else if let Some(cold) = &self.cold {
+                if let Ok(m) = cold.stat(&path).await {
+                    stocke = Some(m.content_length());
+                }
+            }
+        }
+        let stocke = stocke.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("chunk {hash} introuvable")))?;
+        let surcout = (KEY_ID_LEN + NONCE_LEN + GCM_TAG_LEN) as u64;
+        let n = stocke.checked_sub(surcout).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("chunk {hash} trop court ({stocke} octets)"))
+        })?;
+        let mut c = cache.lock().unwrap();
+        if c.len() >= TAILLES_CHUNKS_MAX {
+            c.clear();
+        }
+        c.insert(hash.to_string(), n);
+        Ok(n)
+    }
+
+    /// Les octets `[debut, fin]` (inclusifs) du fichier decrit par `manifest`, en lisant UNIQUEMENT les chunks
+    /// qui recouvrent la plage. La memoire est bornee par la plage demandee, pas par la taille du fichier.
+    pub async fn read_range(&self, manifest: &[String], debut: u64, fin: u64) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity((fin - debut + 1).min(64 * 1024 * 1024) as usize);
+        let mut pos = 0u64;
+        for hash in manifest {
+            if pos > fin {
+                break;
+            }
+            let fin_chunk = pos + self.chunk_plain_len(hash).await?;
+            if fin_chunk > debut {
+                let data = self.read_chunk(hash).await?;
+                let a = (debut.saturating_sub(pos) as usize).min(data.len());
+                let b = (((fin + 1).min(fin_chunk) - pos) as usize).min(data.len());
+                out.extend_from_slice(&data[a..b.max(a)]);
+            }
+            pos = fin_chunk;
+        }
+        Ok(out)
+    }
+
     /// Reads a chunk's encrypted bytes, routing through `chunk_locations` when rows exist
     /// (shard/replica-written chunks): tries each recorded backend in order (shard/primary
     /// location first, then replicas) until one succeeds, so a replica going unreachable
@@ -846,6 +916,44 @@ mod tests {
         // Round-trip through ChunkStore still yields the original plaintext.
         let read_back = store.read_manifest(&manifest).await.unwrap();
         assert_eq!(read_back, data);
+    }
+
+    /// Contenu pseudo-aleatoire (donc decoupe en plusieurs chunks par FastCDC), sans dependance de plus.
+    fn contenu_pseudo_aleatoire(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// La taille en clair deduite du `stat` doit etre exacte pour CHAQUE chunk, et une plage doit rendre
+    /// exactement les octets du fichier, y compris a cheval sur plusieurs chunks et en fin de fichier.
+    #[tokio::test]
+    async fn lecture_partielle_rend_les_bons_octets_sans_tout_relire() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new_fs(dir.path());
+        let data = contenu_pseudo_aleatoire(9 * 1024 * 1024 + 123);
+        let (manifest, size) = store.write(&data).await.unwrap();
+        assert!(manifest.len() >= 3, "le test doit couvrir plusieurs chunks, pas {}", manifest.len());
+
+        let mut somme = 0u64;
+        for h in &manifest {
+            let lu = store.read_chunk(h).await.unwrap().len() as u64;
+            assert_eq!(store.chunk_plain_len(h).await.unwrap(), lu, "taille deduite du stat != taille reelle");
+            somme += lu;
+        }
+        assert_eq!(somme, size as u64);
+
+        let n = data.len() as u64;
+        for (a, b) in [(0, 0), (0, 99), (1_000_000, 1_000_005), (3_000_000, 7_000_000), (n - 10, n - 1), (0, n - 1), (n / 2, n - 1)] {
+            let tranche = store.read_range(&manifest, a, b).await.unwrap();
+            assert_eq!(tranche, data[a as usize..=b as usize], "plage {a}-{b}");
+        }
     }
 
     /// L'invariant du plafond : des chunks TOUS recents (donc intouchables par

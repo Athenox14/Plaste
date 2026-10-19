@@ -1,8 +1,8 @@
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Multipart, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -699,22 +699,18 @@ async fn download(
 
     let manifest: Vec<String> = serde_json::from_str(&version.manifest)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "decode error"))?;
-    let data = state
-        .storage
-        .read_manifest(&manifest)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage read failed"))?;
 
-    let headers = [
-        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-        (header::CONTENT_LENGTH, data.len().to_string()),
-        (
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", file.name),
-        ),
-    ];
-
-    Ok((headers, data))
+    // En flux, comme l'aperçu : un téléchargement de plusieurs Go ne tient plus le fichier en mémoire.
+    // Le téléchargement ignore `Range` (comportement d'origine), d'où des en-têtes vides.
+    let total = version.size.max(0) as u64;
+    Ok(reponse_contenu(
+        state.storage.clone(),
+        manifest,
+        total,
+        "application/octet-stream",
+        &HeaderMap::new(),
+        Some(format!("attachment; filename=\"{}\"", file.name)),
+    ))
 }
 
 // ---------- preview ----------
@@ -755,6 +751,79 @@ pub fn parse_range(value: &str, total_len: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+/// Corps HTTP des octets `[debut, fin]` (inclusifs) d'un fichier, lus chunk par chunk.
+///
+/// La mémoire est bornée à UN chunk (4 Mio au plus), quelle que soit la taille du fichier : l'ancienne version
+/// recomposait le fichier entier avant de découper la plage, donc un film de 1,1 Go dépassait la limite de
+/// 1 Gio du conteneur et tuait Plaste (OOMKilled, pour tous les comptes). Un client qui ferme sa connexion
+/// (saut dans la vidéo) arrête le flux : les chunks suivants ne sont pas lus.
+fn corps_en_flux(storage: std::sync::Arc<crate::storage::ChunkStore>, manifest: Vec<String>, debut: u64, fin: u64) -> Body {
+    let flux = futures_util::stream::unfold((storage, manifest.into_iter(), 0u64), move |(storage, mut it, mut pos)| async move {
+        loop {
+            if pos > fin {
+                return None;
+            }
+            let hash = it.next()?;
+            let fin_chunk = match storage.chunk_plain_len(&hash).await {
+                Ok(n) => pos + n,
+                // Une erreur coupe le flux : pos = u64::MAX arrête la boucle au tour suivant.
+                Err(e) => return Some((Err(e), (storage, it, u64::MAX))),
+            };
+            if fin_chunk <= debut {
+                pos = fin_chunk;
+                continue;
+            }
+            let data = match storage.read_chunk(&hash).await {
+                Ok(d) => d,
+                Err(e) => return Some((Err(e), (storage, it, u64::MAX))),
+            };
+            let a = (debut.saturating_sub(pos) as usize).min(data.len());
+            let b = (((fin + 1).min(fin_chunk) - pos) as usize).min(data.len()).max(a);
+            let morceau = Bytes::from(data).slice(a..b);
+            return Some((Ok::<Bytes, std::io::Error>(morceau), (storage, it, fin_chunk)));
+        }
+    });
+    Body::from_stream(flux)
+}
+
+/// Réponse HTTP pour un fichier de `total` octets, avec gestion de la plage (`Range`) : 206 si une plage valide
+/// est demandée, 200 sinon. `disposition` ajoute `Content-Disposition` (aperçu ou téléchargement).
+fn reponse_contenu(
+    storage: std::sync::Arc<crate::storage::ChunkStore>,
+    manifest: Vec<String>,
+    total: u64,
+    mime: &str,
+    entetes: &HeaderMap,
+    disposition: Option<String>,
+) -> Response {
+    let plage = entetes
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_range(v, total as usize));
+    let (statut, debut, fin) = match plage {
+        Some((a, b)) => (StatusCode::PARTIAL_CONTENT, a as u64, b as u64),
+        None => (StatusCode::OK, 0, total.saturating_sub(1)),
+    };
+    let longueur = if total == 0 { 0 } else { fin - debut + 1 };
+    let mut rep = (statut, corps_en_flux(storage, manifest, debut, fin)).into_response();
+    let h = rep.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(mime).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(longueur));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Some(d) = disposition.and_then(|d| HeaderValue::from_str(&d).ok()) {
+        h.insert(header::CONTENT_DISPOSITION, d);
+    }
+    if statut == StatusCode::PARTIAL_CONTENT {
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes {debut}-{fin}/{total}")) {
+            h.insert(header::CONTENT_RANGE, v);
+        }
+    }
+    rep
+}
+
 /// Sert le contenu d'un fichier, avec gestion de la plage (`Range`).
 ///
 /// Extraite de `preview` pour que WebDAV (`dav.rs`) serve exactement le même
@@ -766,10 +835,7 @@ pub fn parse_range(value: &str, total_len: usize) -> Option<(usize, usize)> {
 /// demandeur possède ce fichier. C'est volontaire, mais c'est aussi le piège —
 /// ne jamais l'appeler sur un identifiant venu directement du client.
 ///
-/// ponytail: charge le fichier entier en mémoire avant de découper la plage
-/// (comportement d'origine). Coûteux sur de la vidéo, où chaque saut relit tout
-/// le fichier ; à convertir en lecture par chunks si la mémoire devient un
-/// problème.
+/// Lecture en flux, chunk par chunk (voir `corps_en_flux`) : la mémoire ne dépend plus de la taille du fichier.
 pub async fn servir_contenu(
     state: &AppState,
     file_id: i64,
@@ -801,42 +867,8 @@ pub async fn servir_contenu(
     let Ok(manifest) = serde_json::from_str::<Vec<String>>(&version.manifest) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "decode error").into_response();
     };
-    let Ok(data) = state.storage.read_manifest(&manifest).await else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "storage read failed").into_response();
-    };
-
-    let mime = mime_for_ext(nom).to_string();
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| parse_range(v, data.len()));
-
-    match range {
-        Some((start, end)) => (
-            StatusCode::PARTIAL_CONTENT,
-            [
-                (header::CONTENT_TYPE, mime),
-                (header::CONTENT_LENGTH, (end - start + 1).to_string()),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (
-                    header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{}", data.len()),
-                ),
-            ],
-            data[start..=end].to_vec(),
-        )
-            .into_response(),
-        None => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, mime),
-                (header::CONTENT_LENGTH, data.len().to_string()),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-            ],
-            data,
-        )
-            .into_response(),
-    }
+    let total = version.size.max(0) as u64;
+    reponse_contenu(state.storage.clone(), manifest, total, &mime_for_ext(nom), headers, None)
 }
 
 async fn preview(
@@ -861,44 +893,16 @@ async fn preview(
 
     let manifest: Vec<String> = serde_json::from_str(&version.manifest)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "decode error"))?;
-    let data = state
-        .storage
-        .read_manifest(&manifest)
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "storage read failed"))?;
 
-    let mime = mime_for_ext(&file.name);
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| parse_range(v, data.len()));
-
-    match range {
-        Some((start, end)) => {
-            let slice = data[start..=end].to_vec();
-            let resp_headers = [
-                (header::CONTENT_TYPE, mime.to_string()),
-                (header::CONTENT_LENGTH, slice.len().to_string()),
-                (header::CONTENT_DISPOSITION, "inline".to_string()),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (
-                    header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{}", data.len()),
-                ),
-            ];
-            Ok((StatusCode::PARTIAL_CONTENT, resp_headers, slice))
-        }
-        None => {
-            let resp_headers = [
-                (header::CONTENT_TYPE, mime.to_string()),
-                (header::CONTENT_LENGTH, data.len().to_string()),
-                (header::CONTENT_DISPOSITION, "inline".to_string()),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::CONTENT_RANGE, String::new()),
-            ];
-            Ok((StatusCode::OK, resp_headers, data))
-        }
-    }
+    let total = version.size.max(0) as u64;
+    Ok(reponse_contenu(
+        state.storage.clone(),
+        manifest,
+        total,
+        &mime_for_ext(&file.name),
+        &headers,
+        Some("inline".to_string()),
+    ))
 }
 
 // ---------- versions ----------
